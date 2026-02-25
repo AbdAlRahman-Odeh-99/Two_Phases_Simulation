@@ -208,7 +208,7 @@ def run_experiment(
                     K_CLUSTERS,
                     random_state=KMEANS_RANDOM_STATE,
                     n_init=KMEANS_N_INIT
-                )
+                ) # NOTE: essentially do a kmeans here
             )
             
             # Phase 1 inference
