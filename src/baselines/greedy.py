@@ -66,5 +66,4 @@ class GreedyBaseline(Baselines):
             initial_obs=initial_obs,
             free_views=self.free_views
         )
-        
         return observed, budget_remaining, summary

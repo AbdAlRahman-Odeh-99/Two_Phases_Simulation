@@ -17,7 +17,7 @@ RANDOM_SEED = 0
 # Experiment parameters
 HORIZON = N_SAMPLES
 COST_PER_MODALITY = 1
-BUDGET_FRACTION = 0.4  # Total budget = Horizon * M * BUDGET_FRACTION
+BUDGET_FRACTION = 0.7  # Total budget = Horizon * BUDGET_FRACTION * (M - len(FREE_VIEWS))
 
 # Free views (always available without cost)
 FREE_VIEWS = {0}

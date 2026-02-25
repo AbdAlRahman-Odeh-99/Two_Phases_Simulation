@@ -105,11 +105,10 @@ def greedy_acquisition_policy(
     if free_views is None:
         free_views = set()
     
-    spent = 0.0
     summary = []
-    
     while True:
         gains = {}
+        spent = 0.0
         
         # Evaluate all unobserved, non-free modalities
         for v in range(M):

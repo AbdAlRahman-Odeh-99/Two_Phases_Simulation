@@ -184,7 +184,7 @@ def run_experiment(
     p_y = np.array(P_Y)
     
     # Budget calculation
-    Budget_total = HORIZON * M_MODALITIES * BUDGET_FRACTION
+    Budget_total = HORIZON * BUDGET_FRACTION * (M_MODALITIES - len(FREE_VIEWS))
     
     all_results = {}
     M = X.shape[1]
@@ -208,7 +208,7 @@ def run_experiment(
                     K_CLUSTERS,
                     random_state=KMEANS_RANDOM_STATE,
                     n_init=KMEANS_N_INIT
-                ) # NOTE: essentially do a kmeans here
+                )
             )
             
             # Phase 1 inference
@@ -266,7 +266,7 @@ if __name__ == "__main__":
     # Run experiments
     results_dict = run_experiment(
         baseline_name="greedy",
-        lambda_costs=LAMBDA_COST_LIST[:3],  # Test first 3 lambda values
+        lambda_costs=LAMBDA_COST_LIST[4:7],  # Test 3 lambda values [0.08, 0.10, 0.12]
         verbose=True
     )
     

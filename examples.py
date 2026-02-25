@@ -46,9 +46,10 @@ def example_basic_usage():
     print(f"   Data shape: {X.shape}, Labels: {Y.shape}")
     print(f"   Clusters: {K_CLUSTERS}, Modalities: {M_MODALITIES}")
     
+    
+    T_ph1 = T_PH1_LIST[0]
     # Initialize Phase 1
     print("\n2. Running Phase 1 initialization...")
-    T_ph1 = T_PH1_LIST[0]
     p_y_learned, learned_means, learned_sigmas, learned_centers = (
         initialization_phase(
             X[:T_ph1],
@@ -63,20 +64,20 @@ def example_basic_usage():
     
     # Make predictions on Phase 1
     print("\n3. Making predictions on Phase 1 data...")
-    correct = 0
+    true_labels, y_hat = [], []
     for i in range(T_ph1):
         obs = {v: X[i, v] for v in range(M_MODALITIES)}
         p_post = posterior_y(obs, p_y_learned, learned_means, learned_sigmas)
-        y_hat = np.argmax(p_post)
-        if y_hat == Y[i]:
-            correct += 1
-    accuracy_ph1 = correct / T_ph1
-    print(f"   Raw accuracy (before label matching): {accuracy_ph1:.3f}")
+        y_hat.append(np.argmax(p_post))
+        true_labels.append(Y[i])
     
-    return X, Y, p_y_learned, learned_means, learned_sigmas
+    y_hat_matched, _ = match_labels(true_labels, y_hat, K_CLUSTERS)
+    correct = sum(1 if y_hat_matched[i] == true_labels[i] else 0 for i in range(len(true_labels)))
+    accuracy_ph1 = correct / T_ph1
+    print(f"   Phase 1 Accuracy: {accuracy_ph1:.3f}")
+    
 
-
-def example_baseline_comparison():
+def example_baseline_comparison_one_sample():
     """Example 2: Compare different baselines."""
     print("\n" + "="*70)
     print("EXAMPLE 2: Baseline Comparison")
@@ -84,7 +85,7 @@ def example_baseline_comparison():
     
     # Generate data
     X, Y, true_means, true_sigmas, rng = generate_synthetic_data(
-        n_samples=1000,  # Smaller for faster example
+        n_samples=5000,  # Smaller for faster example
         k_clusters=K_CLUSTERS,
         m_modalities=M_MODALITIES,
         p_y=np.array(P_Y),
@@ -92,7 +93,7 @@ def example_baseline_comparison():
     )
     
     # Initialize
-    T_ph1 = 200
+    T_ph1 = 250
     p_y_learned, learned_means, learned_sigmas, learned_centers = (
         initialization_phase(X[:T_ph1], K_CLUSTERS)
     )
@@ -100,7 +101,7 @@ def example_baseline_comparison():
     # Test sample
     test_idx = T_ph1 + 10
     x_true = X[test_idx]
-    budget = (HORIZON * M_MODALITIES * BUDGET_FRACTION) / (HORIZON - T_ph1)
+    budget = (HORIZON * (M_MODALITIES - len(FREE_VIEWS)) * BUDGET_FRACTION)
     initial_obs = {v: x_true[v] for v in FREE_VIEWS}
     
     # Greedy baseline
@@ -149,7 +150,6 @@ def example_baseline_comparison():
     print(f"   Random prediction: y={y_random}, entropy={loss_random:.3f}")
     print(f"   True label: {Y[test_idx]}")
 
-
 def example_configuration_modification():
     """Example 3: How to modify configuration."""
     print("\n" + "="*70)
@@ -178,7 +178,6 @@ def example_configuration_modification():
     print("  - FREE_VIEWS: Change which modalities are free")
     print("  - LAMBDA_COST_LIST: Change cost parameters to test")
     print("  - T_PH1_LIST: Change Phase 1 training sizes")
-
 
 def example_custom_baseline():
     """Example 4: Creating a custom baseline."""
@@ -221,73 +220,85 @@ To create a custom baseline:
    - RandomBaseline: Random feature selection
     """)
 
-
 def example_full_experiment_comparison():
-    """Example 5: Running a small comparison experiment."""
+    """Example 5: Running a full comparison experiment."""
     print("\n" + "="*70)
-    print("EXAMPLE 5: Mini Experiment Comparison")
+    print("EXAMPLE 5: Full Experiment Comparison (Phase 2 Inference Accuracy)")
     print("="*70)
     
-    # Smaller dataset for demo
-    N = 500
+    # dataset for demo
+    N_SAMPLES = 5000
     X, Y, true_means, true_sigmas, rng = generate_synthetic_data(
-        n_samples=N,
+        n_samples=N_SAMPLES,
         k_clusters=K_CLUSTERS,
         m_modalities=M_MODALITIES,
         p_y=np.array(P_Y),
         random_seed=RANDOM_SEED
     )
     
-    T_ph1 = 200
-    Budget_total = N * M_MODALITIES * BUDGET_FRACTION
-    Budget_remaining = Budget_total - (T_ph1 * COST_PER_MODALITY * (M_MODALITIES - len(FREE_VIEWS)))
-    
+    T_ph1 = 250
+    budget_total = N_SAMPLES * BUDGET_FRACTION * (M_MODALITIES - len(FREE_VIEWS))
+    budget_remaining = max(0,budget_total - (T_ph1 * COST_PER_MODALITY * (M_MODALITIES - len(FREE_VIEWS))))
+    greedy_budget_remaining, random_budget_remaining = budget_remaining, budget_remaining
+
     # Initialize
     p_y_learned, learned_means, learned_sigmas, learned_centers = (
         initialization_phase(X[:T_ph1], K_CLUSTERS)
     )
     
+    true_labels, predictions_greedy, predictions_random = [], [], []
     results_greedy = {"accuracies": [], "total_budget_spent": 0}
     results_random = {"accuracies": [], "total_budget_spent": 0}
     
-    # Test Phase 2 on a few samples
-    test_samples = 10
-    for i in range(T_ph1, min(T_ph1 + test_samples, N)):
+    # Test Phase 2 samples
+    for i in range(T_ph1, N_SAMPLES):
         x_true = X[i]
         initial_obs = {v: x_true[v] for v in FREE_VIEWS}
-        budget_per_sample = Budget_remaining / (N - T_ph1)
         
         # Greedy
         greedy = GreedyBaseline(
             p_y=p_y_learned, means=learned_means, sigmas=learned_sigmas,
             cost=COST_PER_MODALITY, free_views=FREE_VIEWS, lambda_cost=0.1
         )
-        obs_g, _, _ = greedy.acquire(x_true, budget_per_sample, initial_obs)
+        budget_remaining_before_acquisition = greedy_budget_remaining
+        obs_g, greedy_budget_remaining, _ = greedy.acquire(x_true, greedy_budget_remaining, initial_obs)
         y_g, _ = greedy.predict(obs_g)
-        results_greedy["accuracies"].append(1 if y_g == Y[i] else 0)
-        results_greedy["total_budget_spent"] += (budget_per_sample - _)
+        y_true = Y[i]
+        true_labels.append(y_true)
+        predictions_greedy.append(y_g)
+        results_greedy["total_budget_spent"] += (budget_remaining_before_acquisition - greedy_budget_remaining)
         
         # Random
         random = RandomBaseline(
             p_y_learned, learned_means, learned_sigmas,
             cost=COST_PER_MODALITY, free_views=FREE_VIEWS
         )
-        obs_r, _, _ = random.acquire(x_true, budget_per_sample, initial_obs)
+
+        budget_remaining_before_acquisition = random_budget_remaining
+        obs_r, random_budget_remaining, _ = random.acquire(x_true, random_budget_remaining, initial_obs)
         y_r, _ = random.predict(obs_r)
-        results_random["accuracies"].append(1 if y_r == Y[i] else 0)
-        results_random["total_budget_spent"] += (budget_per_sample - _)
+        predictions_random.append(y_r)
+        results_random["total_budget_spent"] += (budget_remaining_before_acquisition - random_budget_remaining)
+        
+    y_greedy_matched, _ = match_labels(true_labels, predictions_greedy, K_CLUSTERS)
+    y_random_matched, _ = match_labels(true_labels, predictions_random, K_CLUSTERS)
+    results_greedy["accuracies"] = list(1 if y_greedy_matched[i] == true_labels[i] else 0 for i in range(len(true_labels)))        
+    results_random["accuracies"] = list(1 if y_random_matched[i] == true_labels[i] else 0 for i in range(len(true_labels)))        
     
-    print(f"\nResults on {test_samples} test samples:")
-    print(f"  Greedy:  Accuracy={np.mean(results_greedy['accuracies']):.2f}")
-    print(f"  Random:  Accuracy={np.mean(results_random['accuracies']):.2f}")
+    
+    
+    print(f"\nResults using {T_ph1} initialization samples and {N_SAMPLES - T_ph1} test samples:")
+    print(f"  Greedy:  Accuracy={np.mean(results_greedy['accuracies']):.3f}, Budget Spent={results_greedy['total_budget_spent']}/{budget_remaining}")
+    print(f"  Random:  Accuracy={np.mean(results_random['accuracies']):.3f}, Budget Spent={results_random['total_budget_spent']}/{budget_remaining}")
 
 
 if __name__ == "__main__":
     # Run all examples
     example_basic_usage()
-    example_baseline_comparison()
+    example_baseline_comparison_one_sample()
     example_configuration_modification()
     example_custom_baseline()
+    example_full_experiment_comparison()
     
     print("\n" + "="*70)
     print("Examples completed!")
