@@ -71,6 +71,7 @@ from two_stage.two_stage_multiclass import (
 from two_stage_greedy.two_stage_multiclass_greedy import (
     CENTER_UPDATE_MODES,
     REWARD_UPDATE_SCOPES,
+    ACTION_SPACES,
     run_alg_greedy_multiclass,
 )
 
@@ -91,6 +92,7 @@ def run_experiment(
     synthetic_n_classes=SYNTHETIC_N_CLASSES,
     center_update="reward_full",
     reward_update="subsets",
+    action_space="chain",
     alpha_ucb=2.0,
     lr=1e-2,
     step_size=1.0,
@@ -115,6 +117,9 @@ def run_experiment(
     if dataset_name not in ALL_DATASETS:
         msg = f"dataset_name must be one of {ALL_DATASETS}, got {dataset_name!r}"
         raise ValueError(msg)
+    if action_space not in ACTION_SPACES:
+        raise ValueError(f"action_space must be one of {ACTION_SPACES}, "
+                         f"got {action_space!r}")
     if center_update not in CENTER_UPDATE_MODES:
         raise ValueError(f"center_update must be one of {CENTER_UPDATE_MODES}, "
                          f"got {center_update!r}")
@@ -144,7 +149,8 @@ def run_experiment(
           f"sum={paid_costs.sum():.4f}")
     print(f"Stage-2 acquisition: greedy, "
           f"center_update={center_update!r}, alpha_ucb={alpha_ucb:g}"
-          + (f", reward_update={reward_update!r}" if center_update == "reward_estimates" else ""))
+          + (f", reward_update={reward_update!r}, action_space={action_space!r}"
+             if center_update == "reward_estimates" else ""))
 
     all_results = []
 
@@ -183,6 +189,7 @@ def run_experiment(
                     x=X_train, y=Y_train, centers=centers, costs=costs,
                     T1=n_init_samples, training_budget=training_budget, rng=rng,
                     center_update=center_update, reward_update=reward_update,
+                    action_space=action_space,
                     alpha_ucb=alpha_ucb, lr=lr,
                     step_size=step_size, lambda_max=lambda_max,
                     pred_rule=pred_rule,
@@ -237,6 +244,8 @@ def run_experiment(
                     'Experts': np.nan,            # greedy enumerates nothing
                     'center_update': center_update,
                     'reward_update': reward_update if center_update == "reward_estimates" else "",
+                    'action_space': action_space if center_update == "reward_estimates" else "",
+                    'n_arms': stage2_result.get('n_arms', 0),
                     'alpha_ucb': alpha_ucb,
                     'avg_views_acquired': stage2_result['avg_views_acquired'],
                     'n_unique_masks': stage2_result['n_unique_masks'],
@@ -361,6 +370,13 @@ if __name__ == "__main__":
                              "the played combination from its 0/1 reward (bandit feedback); "
                              "with 2^(nviews-1) arms this barely moves off the Stage-1 prior "
                              "and is best treated as the ablation showing why replay matters.")
+    parser.add_argument("--action-space", choices=ACTION_SPACES, default="chain",
+                        help="two_stage_greedy with --center-update reward_estimates "
+                             "ONLY. 'chain' (default): the frozen greedy chain, "
+                             "nviews+1 arms, no modality ceiling. 'full': the "
+                             "original 2^(nviews-1) enumeration, for the "
+                             "chain-vs-full fidelity check only; capped at "
+                             "MAX_REWARD_ESTIMATE_VIEWS views.")
     parser.add_argument("--alpha-ucb", type=float, default=2.0,
                         help="Optimism scale in the greedy oracle's exploration bonus "
                              "sqrt(alpha_ucb*log(t+1))/sqrt(count) (default 2.0, same as "
@@ -409,6 +425,7 @@ if __name__ == "__main__":
         synthetic_n_classes=args.num_classes,
         center_update=args.center_update,
         reward_update=args.reward_update,
+        action_space=args.action_space,
         alpha_ucb=args.alpha_ucb,
         lr=args.lr,
         step_size=args.step_size,
