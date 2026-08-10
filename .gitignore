@@ -21,3 +21,7 @@ ENV/
 # OS
 .DS_Store
 Thumbs.db
+
+
+# contents
+*.png
