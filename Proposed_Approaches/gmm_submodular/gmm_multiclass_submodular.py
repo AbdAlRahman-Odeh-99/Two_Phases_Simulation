@@ -115,6 +115,31 @@ and the metrics.
               (core.submodular_greedy.greedy_chain): S_0 = {free views}
               subset S_1 subset ... subset S_p = all views, i.e. nviews+1
               arms instead of 2^(nviews-1). Tractable at any nviews.
+  "lp_full_opt"
+              ORACLE CEILING for the lp_full family. Same full enumeration,
+              but the arm values are not estimated at all: they are the
+              EXACT accuracies of the TRUE generative means (caller passes
+              true_means; core.optimal_static.synthetic_true_means recovers
+              them, so this mode is SYNTHETIC-ONLY). The LP is solved ONCE
+              before the round loop and each round is a single draw from
+              that frozen distribution -- no UCB, no re-solve, no reward
+              update. Subtracting lp_full from it isolates the cost of
+              LEARNING the arm values from the cost of the action space and
+              of the LP itself. Note it does NOT give the classifier the
+              true means: est_means still learns under `feedback` exactly as
+              in every other mode, so the oracle sits on the ACQUISITION
+              axis alone.
+
+=== PER-ROUND ALLOWANCE (lp_chain / lp_full) ===
+The budget the per-round LP is solved against is ADAPTIVE:
+
+    b_allowance = max(0, remaining_budget) / max(1, n_train - t)
+
+recomputed every round from the budget that survived, over the rounds that
+remain. It was previously frozen at its first post-warmup value; see the
+comment at the assignment for what that cost. "lp_full_opt" is the
+deliberate exception -- solving once is its defining property, so it uses
+the flat training_budget / n_train and never revisits it.
 
 Two details are specific to THIS file (two_stage has a Stage 1; this
 module does not):
@@ -174,13 +199,17 @@ from core.submodular_greedy import (
     # existing `from ...gmm_multiclass_submodular import ACQUISITION_MODES`
     # call sites keep working.
     ACQUISITION_MODES,             # noqa: F401 -- re-exported
+    LP_ACQUISITION_MODES,          # noqa: F401 -- re-exported
     MAX_REWARD_ESTIMATE_VIEWS,     # noqa: F401 -- re-exported
+    ORACLE_ACQUISITION_MODES,      # noqa: F401 -- re-exported
     REWARD_UPDATE_SCOPES,          # noqa: F401 -- re-exported
+    arm_accuracies_from_means,
     bhattacharyya_error_rate,      # noqa: F401 -- re-exported
     build_arm_tables,
     greedy_chain,
     greedy_oracle,
     lp_policy_over_estimates,
+    linprog_policy_over_estimates,
     mask_to_bits,
     multiclass_risk,               # noqa: F401 -- re-exported
 )
@@ -279,7 +308,7 @@ def run_training_phase(nviews, nclasses, costs, n_train, training_budget,
                         alpha_ucb=2.0, lr=1e-2, step_size=1.0,
                         lambda_max=10.0, rng=None,
                         acquisition="greedy", reward_update="subsets",
-                        force_free=True):
+                        force_free=True, true_means=None):
     """
     Multiclass counterpart of gmm_2class_submodular_asymmetric.
     run_training_phase, wrapping the notebook's `simulation`
@@ -292,11 +321,17 @@ def run_training_phase(nviews, nclasses, costs, n_train, training_budget,
 
     feedback : {"full", "bandit"}
         est_means update rule. Unchanged.
-    acquisition : {"greedy", "lp_chain", "lp_full"}, default "greedy"
+    acquisition : {"greedy", "lp_chain", "lp_full", "lp_full_opt"}, default "greedy"
         Per-round subset selection. See the module docstring's ACQUISITION
         MODES section. "greedy" reproduces the previous behaviour exactly.
+    true_means : (nclasses, nviews) array, REQUIRED for "lp_full_opt"
+        The generative class means. Ignored by every other mode. Supply
+        core.optimal_static.synthetic_true_means(...) at the POST-truncation
+        view width (pass X_train.shape[1] as n_views_used).
     reward_update : {"subsets", "selected"}, default "subsets"
-        Ignored under acquisition="greedy" (there are no arms to score).
+        Ignored under acquisition="greedy" (there are no arms to score) and
+        under "lp_full_opt" (the arm values are exact, so there is nothing
+        to score).
         "subsets" replays every arm contained in the played subset;
         "selected" scores only the played arm.
     force_free : bool, default True
@@ -316,8 +351,12 @@ def run_training_phase(nviews, nclasses, costs, n_train, training_budget,
     if reward_update not in REWARD_UPDATE_SCOPES:
         raise ValueError(f"reward_update must be one of {REWARD_UPDATE_SCOPES}, "
                          f"got {reward_update!r}")
+    # NOTE the guard is scoped to the LEARNING LP modes, not to "anything
+    # that is not greedy". lp_full_opt never scores an arm, so reward_update
+    # is inert under it and the combination it would otherwise reject
+    # (bandit + subsets + lp_full_opt) leaks nothing.
     if (feedback == "bandit" and reward_update == "subsets"
-            and acquisition != "greedy"):
+            and acquisition in ("lp_chain", "lp_full")):
         # INCOHERENT COMBINATION, rejected rather than silently run.
         # feedback="bandit" asserts the round observes ONLY the 0/1 reward,
         # but reward_update="subsets" scores every contained arm by calling
@@ -333,13 +372,34 @@ def run_training_phase(nviews, nclasses, costs, n_train, training_budget,
             "counterfactual replay reads y_true, which bandit feedback does not "
             "reveal. Use reward_update='selected' with feedback='bandit', or "
             "feedback='full' with reward_update='subsets'.")
-    if acquisition == "lp_full" and nviews > MAX_REWARD_ESTIMATE_VIEWS:
+    # lp_full_opt shares lp_full's action space, so it inherits the same cap.
+    if acquisition in ("lp_full", "lp_full_opt") and nviews > MAX_REWARD_ESTIMATE_VIEWS:
         raise ValueError(
-            f"acquisition='lp_full' enumerates 2^(nviews-1) = 2^{nviews - 1} "
+            f"acquisition={acquisition!r} enumerates 2^(nviews-1) = 2^{nviews - 1} "
             f"subsets eagerly; nviews={nviews} exceeds "
             f"MAX_REWARD_ESTIMATE_VIEWS={MAX_REWARD_ESTIMATE_VIEWS}. Use "
             f"acquisition='lp_chain' (nviews+1 arms), trim with "
             f"max_modalities, or use acquisition='greedy'.")
+
+    is_oracle = acquisition in ORACLE_ACQUISITION_MODES
+    if is_oracle:
+        # Fail HERE rather than at the LP call: an oracle mode silently
+        # falling back to est_means would look like a working run and would
+        # quietly stop being an oracle ceiling.
+        if true_means is None:
+            raise ValueError(
+                f"acquisition={acquisition!r} needs the TRUE generative means, "
+                f"which exist only for the synthetic datasets. Pass "
+                f"true_means=core.optimal_static.synthetic_true_means(...), or "
+                f"use acquisition='lp_full' for the learned-estimate version of "
+                f"the same action space.")
+        true_means = np.asarray(true_means, dtype=np.float64)
+        if true_means.shape != (nclasses, nviews):
+            raise ValueError(
+                f"true_means must have shape ({nclasses}, {nviews}), got "
+                f"{true_means.shape}. synthetic_true_means must be called with "
+                f"n_views_used=X_train.shape[1] -- the generator's width and "
+                f"the post-max_modalities width are not the same thing.")
     if rng is None:
         rng = np.random.default_rng(0)
 
@@ -372,11 +432,47 @@ def run_training_phase(nviews, nclasses, costs, n_train, training_budget,
     # Persistent statistics indexed by the subset's bitmask.
     arm_reward_stats = {}
     arm_count_stats = {}
+    # b_allowance is now recomputed EVERY round inside the LP branch from the
+    # budget that is actually left (see the loop). It is seeded here only so
+    # the name exists for the oracle branch and the returned diagnostics.
     b_allowance = spending_ratio
-    lp_initialized = False
+    p_oracle = None
     warmup_rows = []                  # warmup rounds that were FULLY observed
     views_trace = np.zeros(n_train)
     seen_masks = set()
+
+    # ── ORACLE SETUP (acquisition="lp_full_opt" only) ──
+    # Everything this mode needs is known before round 0, so all of it
+    # happens HERE and the round loop degenerates to a single rng draw.
+    #
+    # Arm values are the TRUE-means accuracies on the very rows this phase
+    # will run over -- an IN-SAMPLE optimum with no estimation error, the
+    # same relaxation core.optimal_static documents. There is no UCB bonus
+    # because there is nothing to be uncertain about.
+    #
+    # The allowance is the FLAT training_budget / n_train, and it stays flat:
+    # "solve once, outside the loop" and "re-solve against the budget that
+    # is left" are mutually exclusive, and this mode is deliberately the
+    # former. That makes lp_full_opt the ceiling for NON-ADAPTIVE policies
+    # specifically -- it draws from a fixed distribution that never looks at
+    # x_t or at how much budget survived. The adaptive lp_chain / lp_full can
+    # legitimately land above it; see core.optimal_static's "IS NOT a bound
+    # for ADAPTIVE acquisition" note, which applies verbatim here.
+    if is_oracle:
+        tables = build_arm_tables(generate_view_combinations(nviews), costs, nviews)
+        combo_masks = tables["combo_masks"]
+        combo_cost = tables["combo_cost"]
+        cost_order = tables["cost_order"]
+        arm_bits = tables["arm_bits"]
+        bit_index = tables["bit_index"]
+
+        r_hat = arm_accuracies_from_means(X_train, Y_train, true_means, combo_masks)
+        # Reported as the "count" behind each value. n_train is the honest
+        # figure: every arm was scored on every training row.
+        combo_counts = np.full(len(arm_bits), float(n_train))
+
+        p_oracle, omd_lambda = linprog_policy_over_estimates(
+            r_hat, combo_cost, spending_ratio)
 
     for t in range(n_train):
         if t < nclasses:
@@ -391,6 +487,17 @@ def run_training_phase(nviews, nclasses, costs, n_train, training_budget,
             optimistic_diff_mean_sq = diff_mean_sq + bonus_mat
             subset = greedy_oracle(optimistic_diff_mean_sq, costs, omd_lambda,
                                    remaining_budget, free_indices)
+            is_init = False
+        elif is_oracle:
+            # ── FROZEN ORACLE POLICY ("lp_full_opt") ──
+            # The whole round: one draw from the distribution solved above.
+            # No arm rebuild, no UCB, no LP, no estimate to update. The only
+            # state that still moves is est_means (the classifier keeps
+            # learning, exactly as under the other modes) and the budget.
+            if remaining_budget <= 0:
+                subset = free_only_subset.copy()
+            else:
+                subset = combo_masks[int(rng.choice(len(p_oracle), p=p_oracle))].copy()
             is_init = False
         else:
             # ── LP over an ENUMERATED arm set ("lp_chain" / "lp_full") ──
@@ -428,10 +535,8 @@ def run_training_phase(nviews, nclasses, costs, n_train, training_budget,
                     r_hat[j] = arm_reward_stats[key]
                     combo_counts[j] = arm_count_stats[key]
 
-                # Set the LP allowance only once, immediately after warmup.
-                if not lp_initialized:
-                    b_allowance = (max(0.0, remaining_budget) / max(1, n_train - t))
-                    lp_initialized = True
+            # adaptive per-round alloance
+            b_allowance = max(0.0, remaining_budget) / max(1, n_train - t)
 
             if remaining_budget <= 0:
                 # Absorbing fallback policy once the pool is gone.
@@ -440,9 +545,11 @@ def run_training_phase(nviews, nclasses, costs, n_train, training_budget,
                 round_idx = t - nclasses  # 0-based, drives the log(t+1) bonus
                 ucb = r_hat + np.sqrt(
                     alpha_ucb * np.log(round_idx + 2) / combo_counts)
-                i_lo, i_hi, p_hi, omd_lambda = lp_policy_over_estimates(
-                    ucb, combo_cost, cost_order, b_allowance)
-                j = i_hi if (p_hi > 0.0 and float(rng.random()) < p_hi) else i_lo
+                #i_lo, i_hi, p_hi, omd_lambda = lp_policy_over_estimates(
+                #    ucb, combo_cost, cost_order, b_allowance)
+                #j = i_hi if (p_hi > 0.0 and float(rng.random()) < p_hi) else i_lo
+                p_lp, omd_lambda = linprog_policy_over_estimates(ucb, combo_cost, b_allowance)
+                j = int(rng.choice(len(p_lp), p=p_lp))
                 subset = combo_masks[j].copy()
             is_init = False
 
@@ -476,10 +583,17 @@ def run_training_phase(nviews, nclasses, costs, n_train, training_budget,
         y_true = int(Y_train[t])
         reward = y_pred == y_true
 
-        # ── per-arm reward-estimate update (LP modes only) ──
+        # ── per-arm reward-estimate update (LEARNING LP modes only) ──
         # Runs BEFORE the centre update so every arm is scored under the
         # same est_means the played prediction used.
-        if combo_masks is not None:
+        #
+        # `not is_oracle`, NOT just "an arm table exists": lp_full_opt builds
+        # combo_masks too, and its r_hat holds the exact true-means values.
+        # Averaging observed rewards into those would corrupt the oracle into
+        # a slowly-drifting estimate of the LEARNED classifier's accuracy --
+        # a silent failure, since the run would still complete and the
+        # numbers would still look plausible.
+        if combo_masks is not None and not is_oracle:
             played_bits = mask_to_bits(subset)
             if reward_update == "selected":
                 # BANDIT scope: one observation, the played arm, from the
@@ -557,11 +671,17 @@ def run_training_phase(nviews, nclasses, costs, n_train, training_budget,
         "spent": total_spent,
         # ── acquisition diagnostics (extra keys; existing callers ignore) ──
         "acquisition": acquisition,
-        "reward_update": reward_update if acquisition != "greedy" else "",
+        "reward_update": ("" if acquisition in ("greedy",) + ORACLE_ACQUISITION_MODES
+                          else reward_update),
         "n_arms": 0 if combo_masks is None else int(combo_masks.shape[0]),
         "combo_rewards": r_hat,
         "combo_counts": combo_counts,
         "lambda_final": float(omd_lambda),
+        # Last value of the now per-round LP allowance (== spending_ratio
+        # under greedy, which never touches it, and the flat one-shot
+        # allowance under lp_full_opt).
+        "b_allowance_final": float(b_allowance),
+        "oracle_probs": p_oracle,
         "avg_views_acquired": float(np.mean(views_trace)),
         "n_unique_masks": len(seen_masks),
     }

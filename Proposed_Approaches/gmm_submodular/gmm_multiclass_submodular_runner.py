@@ -74,9 +74,11 @@ from core.datasets import (
 )
 from core.excel_utils import _style_sheet
 from core.lp_colgen import solve_lp_policy_colgen_multiclass
+from core.optimal_static import synthetic_true_means
 
 from gmm_submodular.gmm_multiclass_submodular import (
     ACQUISITION_MODES,
+    ORACLE_ACQUISITION_MODES,
     REWARD_UPDATE_SCOPES,
     greedy_oracle,  # noqa: F401 -- re-exported
     multiclass_risk,  # noqa: F401 -- re-exported
@@ -115,9 +117,19 @@ def run_experiment(
     feedback: "full" (y_true revealed every round) or "bandit" (one-bit
         reward only) -- selects the training-phase update rule.
     acquisition: "greedy" (default; per-round submodular greedy + OMD dual),
-        "lp_chain" (per-round LP over the nviews+1 greedy chain) or
+        "lp_chain" (per-round LP over the nviews+1 greedy chain),
         "lp_full" (per-round LP over the full 2^(nviews-1) enumeration --
-        capped by gmm_multiclass_submodular.MAX_REWARD_ESTIMATE_VIEWS).
+        capped by gmm_multiclass_submodular.MAX_REWARD_ESTIMATE_VIEWS), or
+        "lp_full_opt" (the ORACLE ceiling for lp_full: exact true-means arm
+        values, LP solved once before the loop, each round a draw from the
+        frozen distribution). "lp_full_opt" needs the generative means and
+        so is SYNTHETIC-ONLY; this function recovers them itself via
+        core.optimal_static.synthetic_true_means and raises for any real
+        dataset. It is also the one mode that ignores synthetic_seed drift:
+        the means are re-derived from synthetic_seed / synthetic_mean_scale
+        / synthetic_n_classes, so those must match what generated X_full --
+        they do here by construction, since the same values feed
+        load_dataset_as_numpy a few lines above.
     reward_update: "subsets" (counterfactual replay of every arm contained
         in the played subset) or "selected" (played arm only). Ignored
         under acquisition="greedy".
@@ -154,7 +166,7 @@ def run_experiment(
         raise ValueError(f"reward_update must be one of {REWARD_UPDATE_SCOPES}, "
                           f"got {reward_update!r}")
     if (feedback == "bandit" and reward_update == "subsets"
-            and acquisition != "greedy"):
+            and acquisition in ("lp_chain", "lp_full")):
         # Same guard run_training_phase enforces, hoisted here so the run
         # fails before loading a dataset rather than partway through seed 1.
         raise ValueError(
@@ -162,6 +174,20 @@ def run_experiment(
             "counterfactual replay reads y_true, which bandit feedback does not "
             "reveal. Use reward_update='selected' with feedback='bandit', or "
             "feedback='full' with reward_update='subsets'.")
+
+    if acquisition in ORACLE_ACQUISITION_MODES and dataset_name not in SYNTHETIC_DATASETS:
+        # Hoisted ABOVE load_dataset_as_numpy deliberately. The true-means
+        # recovery below has to wait for nviews, but this check does not, and
+        # a real-dataset load can be slow or can fail on its own (network
+        # fetch, missing cache) -- so the user would eat that wait, or a
+        # confusing ConnectionError, before reaching a rejection that was
+        # decidable from the flags alone.
+        raise ValueError(
+            f"acquisition={acquisition!r} needs the TRUE generative means, which "
+            f"exist only for the synthetic datasets {SYNTHETIC_DATASETS}; got "
+            f"{dataset_name!r}. Substituting a sample mean would turn the oracle "
+            f"into a plug-in estimate the learning modes can beat, which is worse "
+            f"than no ceiling at all. Use acquisition='lp_full' on real data.")
 
     X_full, Y_full, feature_names = load_dataset_as_numpy(
         dataset_name, max_modalities=max_modalities, data_path=data_path,
@@ -175,7 +201,41 @@ def run_experiment(
     )
     n_samples, nviews = X_full.shape
     nclasses = int(Y_full.max()) + 1
-    ru_tag = "" if acquisition == "greedy" else f"/{reward_update}"
+
+    # ── ORACLE ACQUISITION SETUP (acquisition="lp_full_opt" only) ──
+    # Recovered ONCE per run, not per seed: the generative means are a
+    # property of the DATASET, not of the train/inference split, so every
+    # seed and every budget fraction shares them.
+    #
+    # n_views_used=nviews, NOT synthetic_n_views. load_dataset_as_numpy
+    # applies features[:, :max_modalities] to synthetic data too, so the
+    # generator's width and the width actually present in X_full differ
+    # whenever --max-modalities is set. synthetic_true_means must draw at
+    # the FULL width and truncate afterwards (numpy fills row-major, so
+    # drawing at the narrow width yields different numbers); passing nviews
+    # here is what tells it where to cut. Getting this backwards produces
+    # plausible-looking but entirely wrong means -- an oracle that is
+    # quietly not an oracle, with nothing visibly failing.
+    true_means = None
+    if acquisition in ORACLE_ACQUISITION_MODES:
+        # Dataset eligibility was already rejected above; this is the recovery,
+        # which needs nviews and so has to happen after the load.
+        true_means = synthetic_true_means(
+            dataset_name,
+            synthetic_n_views=synthetic_n_views,
+            n_views_used=nviews,
+            synthetic_seed=synthetic_seed,
+            mean_scale=synthetic_mean_scale,
+            n_classes=synthetic_n_classes,
+        )
+        print(f"  [oracle] recovered true means for acquisition={acquisition}: "
+              f"shape {true_means.shape}")
+    # reward_update is inert under BOTH greedy (no arms) and the oracle
+    # modes (exact arm values, never scored), so neither is tagged with
+    # one -- a "/subsets" suffix on an lp_full_opt run would advertise a
+    # scoring scope that never ran.
+    _has_ru = acquisition not in ("greedy",) + ORACLE_ACQUISITION_MODES
+    ru_tag = f"/{reward_update}" if _has_ru else ""
     print(f"{dataset_name}: {n_samples} samples, {nviews} views, "
           f"{nclasses} classes, feedback={feedback}, "
           f"acquisition={acquisition}{ru_tag} "
@@ -240,13 +300,14 @@ def run_experiment(
                 est_means_init=est_means_init, feedback=feedback,
                 alpha_ucb=alpha_ucb, lr=lr, rng=rng,
                 acquisition=acquisition, reward_update=reward_update,
+                true_means=true_means,
             )
             train_time = time.time() - train_start
             print(f"  [Training] Reward: {ph1['train_reward']:.3f} | F1: {ph1['train_f1']:.3f} "
                   f"| AUROC: {ph1['train_auroc']:.3f} | Spent: {ph1['spent']:.4f} / {training_budget:.4f} "
                   f"| Time: {train_time:.2f}s")
-            if acquisition != "greedy":
-                print(f"  [Training] Acquisition {acquisition}/{reward_update}: "
+            if acquisition != "greedy":  # every LP mode has an arm count
+                print(f"  [Training] Acquisition {acquisition}{ru_tag}: "
                       f"{ph1['n_arms']} arms "
                       f"(full enumeration would have been 2^{nviews - 1} = "
                       f"{2 ** (nviews - 1)}) | avg views/round: "
@@ -506,8 +567,8 @@ if __name__ == "__main__":
         image_data_home=args.image_cache_dir,
     )
 
-    acq_label = args.acquisition + ("" if args.acquisition == "greedy"
-                                    else f"/{args.reward_update}")
+    _cli_has_ru = args.acquisition not in ("greedy",) + ORACLE_ACQUISITION_MODES
+    acq_label = args.acquisition + (f"/{args.reward_update}" if _cli_has_ru else "")
     print(f"\n{'=' * 70}\nSUMMARY (mean +/- std across seeds) -- {args.dataset} / "
           f"{args.feedback} / {acq_label}\n{'=' * 70}")
     print(f"{'Fraction':<10}{'Train Reward':>16}{'Train F1':>12}{'Train AUROC':>14}"
@@ -544,7 +605,8 @@ if __name__ == "__main__":
     # do not overwrite each other. Empty for the default, keeping existing
     # filenames byte-identical to before this option existed.
     acq_tag = ("" if args.acquisition == "greedy"
-               else f"_{args.acquisition}_{args.reward_update}")
+               else f"_{args.acquisition}_{args.reward_update}" if _cli_has_ru
+               else f"_{args.acquisition}")
     output_xlsx = args.output_xlsx or (
         f"results_gmm_{args.feedback}{acq_tag}_{args.dataset}_"
         f"max{maxmod_label}_seeds{len(seeds)}{ti_tag}{classes_tag}.xlsx"
@@ -552,6 +614,5 @@ if __name__ == "__main__":
     save_results_to_excel(results, budget_fractions, args.dataset, args.feedback,
                           seeds=seeds, filename=output_xlsx,
                           acquisition=args.acquisition,
-                          reward_update=("" if args.acquisition == "greedy"
-                                         else args.reward_update))
+                          reward_update=(args.reward_update if _cli_has_ru else ""))
     print(f"Execution time: {time.time() - t0:.1f} seconds")
