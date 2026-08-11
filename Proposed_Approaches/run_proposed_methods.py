@@ -37,8 +37,9 @@ they still run correctly on the 2-class datasets too.
 
   - submodular: gmm_submodular/gmm_multiclass_submodular.py, runnable in
     full-feedback or bandit-feedback mode via --feedback, and under any of
-    three ACQUISITION policies via --acquisition (greedy / lp_chain /
-    lp_full -- see that module's ACQUISITION MODES docstring section).
+    four ACQUISITION policies via --acquisition (greedy / lp_chain /
+    lp_full / lp_full_opt -- see that module's ACQUISITION MODES docstring
+    section).
     --acquisition is orthogonal to --feedback: the former picks which
     subset is acquired each round, the latter how the centres are updated
     afterwards.
@@ -88,6 +89,8 @@ init and bandit-training errors, NOT inference) is kept in its own
     python run_proposed_methods.py --method submodular --dataset synthetic --acquisition lp_full --reward-update selected --max-modalities 8
     python run_proposed_methods.py --method two_stage_greedy --dataset synthetic --num-classes 3 --max-modalities 10
     python run_proposed_methods.py --method two_stage_greedy --dataset actg175 --acquisition lp_chain
+    # oracle ceiling for lp_full (synthetic only -- it needs the generative means):
+    python run_proposed_methods.py --method submodular --dataset synthetic --acquisition lp_full_opt --max-modalities 8
 
 Run `python run_proposed_methods.py --help` for the full flag list.
 """
@@ -123,7 +126,11 @@ from core.multiclass_common import PRED_RULES
 # --acquisition and --reward-update are SHARED by both methods and mean the
 # same thing in each, so both read from ONE definition in core rather than
 # from per-method copies the driver would have to assert were in sync.
-from core.submodular_greedy import ACQUISITION_MODES, REWARD_UPDATE_SCOPES
+from core.submodular_greedy import (
+    ACQUISITION_MODES,
+    ORACLE_ACQUISITION_MODES,
+    REWARD_UPDATE_SCOPES,
+)
 
 # Both methods are MULTICLASS and class-count-agnostic (they reduce to the
 # binary case at K == 2). The binary-only bandit / submodular / two_stage
@@ -293,9 +300,14 @@ def _acquisition_label(acquisition, reward_update):
     across BOTH methods, which is the point of the unification:
     "greedy", "lp_chain+subsets", "lp_full+selected", ...
     """
-    if acquisition == "greedy":
-        # reward_update is inert: greedy has no enumerated arms to score.
-        return "greedy"
+    if acquisition in ("greedy",) + ORACLE_ACQUISITION_MODES:
+        # reward_update is inert under BOTH: greedy has no enumerated arms
+        # to score, and the oracle modes have exact arm values that are
+        # never scored. Appending a scope either would advertise a scoring
+        # rule that never ran -- and would split one policy across two
+        # 'Acquisition' values in the unified table purely on the strength
+        # of a flag that did nothing.
+        return acquisition
     return f"{acquisition}+{reward_update}"
 
 
@@ -337,6 +349,17 @@ def run_method(method, dataset, max_modalities, seeds, budget_fractions,
     if acquisition == "greedy" and reward_update != "subsets":
         print("WARNING: --reward-update has no effect under --acquisition greedy "
               "(there are no enumerated arms to score); ignored.")
+    if acquisition in ORACLE_ACQUISITION_MODES and reward_update != "subsets":
+        print(f"WARNING: --reward-update has no effect under --acquisition "
+              f"{acquisition} (its arm values come from the true means and are "
+              f"never scored); ignored.")
+    if acquisition in ORACLE_ACQUISITION_MODES and method == "submodular" and feedback != "full":
+        # NOT an error: the oracle governs ACQUISITION, --feedback governs the
+        # CENTRE update, and both still run. Worth saying out loud because the
+        # combination is easy to read as "fully oracle" when it is not.
+        print(f"NOTE: --acquisition {acquisition} gives the ACQUISITION policy "
+              f"the true means; the classifier still learns under --feedback "
+              f"{feedback}. This is not an oracle-classifier run.")
     if method != "submodular" and feedback != "full":
         print("WARNING: --feedback governs the CENTRE update, which only "
               "submodular has (two_stage_greedy holds its Stage-1 centres "
@@ -524,7 +547,22 @@ if __name__ == "__main__":
                               "at any nviews. 'lp_full': the same over the FULL 2^(nviews-1) "
                               "enumeration -- the small-nviews fidelity check for what the "
                               "chain restriction costs, capped at MAX_REWARD_ESTIMATE_VIEWS "
-                              "views. BOTH methods take these three names verbatim -- there "
+                              "views. 'lp_full_opt': the ORACLE CEILING for lp_full -- same "
+                              "action space, but the arm values are the EXACT accuracies of "
+                              "the TRUE generative means instead of UCB estimates, and the LP "
+                              "is solved ONCE before the loop, so each round is a single draw "
+                              "from a frozen distribution. lp_full_opt minus lp_full is the "
+                              "price of LEARNING the arm values, holding action space and LP "
+                              "fixed. SYNTHETIC DATASETS ONLY (there is no true mean for real "
+                              "data); --reward-update and --alpha-ucb are both inert under it. "
+                              "It does NOT give the classifier the true means -- submodular "
+                              "still learns centres under --feedback, two_stage_greedy still "
+                              "predicts with its Stage-1 centres -- so it is a ceiling on the "
+                              "acquisition axis alone. Being non-adaptive by construction (it "
+                              "never looks at x_t or at surviving budget), the ADAPTIVE modes "
+                              "may legitimately score above it; see core/optimal_static.py's "
+                              "'IS NOT a bound for ADAPTIVE acquisition' note. "
+                              "BOTH methods take these four names verbatim -- there "
                               "is no per-method translation. For two_stage_greedy all three "
                               "hold the Stage-1 centres FROZEN, which is what makes them a "
                               "clean one-axis comparison; the four learning-centre modes it "
@@ -597,7 +635,8 @@ if __name__ == "__main__":
     # argparse error rather than a traceback out of the training loop.
     # See gmm_multiclass_submodular.run_training_phase's guard for why.
     if (args.method == "submodular" and args.feedback == "bandit"
-            and args.reward_update == "subsets" and args.acquisition != "greedy"):
+            and args.reward_update == "subsets"
+            and args.acquisition in ("lp_chain", "lp_full")):
         parser.error(
             "--feedback bandit is incompatible with --reward-update subsets: the "
             "counterfactual replay reads y_true, which bandit feedback does not "
@@ -665,7 +704,12 @@ if __name__ == "__main__":
         # -- deliberate, since both methods now name the same policy the
         # same way.
         acq_tag = ""
-        if args.acquisition != "greedy":
+        if args.acquisition in ORACLE_ACQUISITION_MODES:
+            # No reward_update component (never scored) and no alpha component
+            # (no UCB bonus exists to scale) -- both would name knobs the run
+            # ignored, and would write distinct filenames for identical runs.
+            acq_tag = f"_{args.acquisition}"
+        elif args.acquisition != "greedy":
             acq_tag = f"_{args.acquisition}-{args.reward_update}"
             if args.alpha_ucb != 2.0:
                 acq_tag += f"_alpha{args.alpha_ucb:g}"
