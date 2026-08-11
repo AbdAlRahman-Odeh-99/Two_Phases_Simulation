@@ -95,7 +95,7 @@ from core.submodular_greedy import (
     greedy_oracle,
     lp_policy_over_estimates,    # noqa: F401 -- re-exported (moved here)
     linprog_policy_over_estimates,
-    multiclass_risk,
+    multiclass_reward,
 )
 
 # These six lived in two_stage/two_stage_multiclass.py until that module
