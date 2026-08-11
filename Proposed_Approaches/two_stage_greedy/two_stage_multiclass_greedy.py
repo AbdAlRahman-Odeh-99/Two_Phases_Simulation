@@ -19,9 +19,30 @@ ACQUISITION_MODES from core.submodular_greedy):
   "lp_full"   The same over the FULL 2^(nviews-1) enumeration -- the
               small-nviews fidelity check for what the chain restriction
               costs. Capped at MAX_REWARD_ESTIMATE_VIEWS views.
+  "lp_full_opt"
+              ORACLE CEILING for lp_full. Same action space, but the arm
+              values are not estimated: they are the exact accuracies of the
+              TRUE generative means on the Stage-2 rows (caller passes
+              true_means, so SYNTHETIC-ONLY), and the LP is solved ONCE
+              before the Stage-2 loop. Each round is then a single draw from
+              a frozen distribution -- no UCB, no re-solve, no r_hat update.
+              lp_full_opt minus lp_full is the price of LEARNING the arm
+              values, holding action space and LP fixed.
 
-The lp_* modes learn per-ARM reward estimates (r_hat), not centres, so
-nothing about the classifier moves under any of the three.
+The lp_chain/lp_full modes learn per-ARM reward estimates (r_hat), not
+centres, and lp_full_opt learns nothing at all, so nothing about the
+classifier moves under any of the four -- including lp_full_opt, which
+gets oracle ARM VALUES but still predicts with the Stage-1 centres.
+
+=== PER-ROUND ALLOWANCE (lp_chain / lp_full) ===
+The budget the per-round LP is solved against is ADAPTIVE:
+
+    b_t = max(0, training_remaining_budget) / max(1, total_samples - t)
+
+recomputed each round from the budget that survived, over the rounds that
+remain. It was previously frozen at the pre-loop (training_budget - T1)/T2.
+"lp_full_opt" is the deliberate exception: solving once is its defining
+property, so it uses the flat ratio and never revisits it.
 
 === HISTORY: the deleted centre-learning modes ===
 This file used to carry a second axis, `center_update`, with four modes
@@ -65,11 +86,15 @@ from core.submodular_greedy import (
     # method and gmm_multiclass_submodular agree on what run_proposed_
     # methods.py's --acquisition / --reward-update values mean.
     ACQUISITION_MODES,           # noqa: F401 -- re-exported
+    LP_ACQUISITION_MODES,        # noqa: F401 -- re-exported
     MAX_REWARD_ESTIMATE_VIEWS,   # noqa: F401 -- re-exported
+    ORACLE_ACQUISITION_MODES,    # noqa: F401 -- re-exported
     REWARD_UPDATE_SCOPES,        # noqa: F401 -- re-exported
+    arm_accuracies_from_means,
     greedy_chain,                # noqa: F401 -- re-exported (moved here)
     greedy_oracle,
     lp_policy_over_estimates,    # noqa: F401 -- re-exported (moved here)
+    linprog_policy_over_estimates,
     multiclass_risk,
 )
 
@@ -85,10 +110,13 @@ from core.multiclass_common import (
     _pred_pairwise_vote,
 )
 
-# The action space of the two LP modes is carried by the mode NAME
-# ("lp_chain" / "lp_full"), so there is no separate action_space flag:
-# LP_ACTION_SPACE[acquisition] is the single place that mapping lives.
-LP_ACTION_SPACE = {"lp_chain": "chain", "lp_full": "full"}
+# The action space of the LP modes is carried by the mode NAME, so there is
+# no separate action_space flag: LP_ACTION_SPACE[acquisition] is the single
+# place that mapping lives. "lp_full_opt" enumerates the same full action
+# space as "lp_full" -- they differ in where the arm VALUES come from
+# (true means vs. UCB estimates) and in how often the LP is solved, not in
+# what the policy may play.
+LP_ACTION_SPACE = {"lp_chain": "chain", "lp_full": "full", "lp_full_opt": "full"}
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -169,7 +197,8 @@ def run_alg_greedy_multiclass(x, y, centers, costs, T1, training_budget, rng,
                               acquisition="greedy", alpha_ucb=2.0,
                               step_size=1.0, lambda_max=10.0,
                               pred_rule="nearest_center",
-                              force_free=True, reward_update="subsets"):
+                              force_free=True, reward_update="subsets",
+                              true_means=None):
     """Greedy counterpart of two_stage_multiclass.run_alg_multiclass.
 
     Parameters
@@ -186,7 +215,7 @@ def run_alg_greedy_multiclass(x, y, centers, costs, T1, training_budget, rng,
         EXP4 version's (view_combinations, combo_costs) pair.
     T1, training_budget, rng, step_size, lambda_max, pred_rule
         Identical meaning to run_alg_multiclass.
-    acquisition : {"greedy", "lp_chain", "lp_full"}
+    acquisition : {"greedy", "lp_chain", "lp_full", "lp_full_opt"}
         The per-round acquisition policy -- see the module docstring.
         Default "greedy". Same vocabulary as
         gmm_multiclass_submodular.run_training_phase's flag of the same
@@ -195,7 +224,15 @@ def run_alg_greedy_multiclass(x, y, centers, costs, T1, training_budget, rng,
         on this axis.
     reward_update : {"subsets", "selected"}
         Arm-scoring scope, lp_chain/lp_full ONLY; inert under "greedy",
-        which has no enumerated arms.
+        which has no enumerated arms, and under "lp_full_opt", whose arm
+        values are exact and never scored.
+    true_means : (nclasses, nviews) array, REQUIRED for "lp_full_opt"
+        The generative class means -- SYNTHETIC datasets only. Supply
+        core.optimal_static.synthetic_true_means(...) at the POST-truncation
+        view width. NOTE this does not touch the classifier: Stage 2 still
+        predicts with the frozen Stage-1 `centers`, so the mode isolates the
+        acquisition axis and its accuracy is NOT an upper bound on what a
+        method with oracle CENTRES could reach.
     alpha_ucb : float, default 2.0
         Optimism scale in the bonus sqrt(alpha_ucb * log(t+1)) / sqrt(count)
         -- same knob and same default as
@@ -224,6 +261,17 @@ def run_alg_greedy_multiclass(x, y, centers, costs, T1, training_budget, rng,
     # One boolean, computed once, replacing the old
     # `center_update == "reward_estimates"` test at each of its five sites.
     use_lp = acquisition in LP_ACTION_SPACE
+    # Second boolean: an oracle mode enumerates and plays like an LP mode but
+    # neither estimates nor re-solves, so it splits off from `use_lp` at
+    # exactly two sites -- the acquisition branch and the r_hat update.
+    is_oracle = acquisition in ORACLE_ACQUISITION_MODES
+    if is_oracle and true_means is None:
+        raise ValueError(
+            f"acquisition={acquisition!r} needs the TRUE generative means, which "
+            f"exist only for the synthetic datasets. Pass "
+            f"true_means=core.optimal_static.synthetic_true_means(...), or use "
+            f"acquisition='lp_full' for the learned-estimate version of the same "
+            f"action space.")
 
     total_samples = len(x)
     T2 = total_samples - T1
@@ -268,7 +316,7 @@ def run_alg_greedy_multiclass(x, y, centers, costs, T1, training_budget, rng,
             # identical seeds at small nviews.
             if nviews > MAX_REWARD_ESTIMATE_VIEWS:
                 raise ValueError(
-                    f"acquisition='lp_full' enumerates 2^(nviews-1) = "
+                    f"acquisition={acquisition!r} enumerates 2^(nviews-1) = "
                     f"2^{nviews - 1} combinations eagerly; nviews={nviews} "
                     f"exceeds MAX_REWARD_ESTIMATE_VIEWS="
                     f"{MAX_REWARD_ESTIMATE_VIEWS}. Use --acquisition lp_chain "
@@ -287,8 +335,28 @@ def run_alg_greedy_multiclass(x, y, centers, costs, T1, training_budget, rng,
             combo_cost[j] = float(costs[combo_masks[j]].sum())
         # costs never change, so the LP's cost ordering is computed ONCE
         cost_order = np.argsort(combo_cost, kind="stable")
-        r_hat, combo_counts = stage1_combo_rewards(x, y, est_centers, T1,
-                                                   combos, nviews)
+        if is_oracle:
+            # EXACT arm values, not a Stage-1 estimate of them: each arm's
+            # accuracy under the TRUE means, measured on the Stage-2 rows
+            # this policy is about to face. Deliberately NOT x[:T1] --
+            # stage1_combo_rewards replays Stage 1 because that is the only
+            # fully observed prefix an ESTIMATOR is allowed to look at, but
+            # an oracle has no such restriction and the rows that matter are
+            # the ones being scored.
+            true_means = np.asarray(true_means, dtype=np.float64)
+            if true_means.shape != (nclasses, nviews):
+                raise ValueError(
+                    f"true_means must have shape ({nclasses}, {nviews}), got "
+                    f"{true_means.shape}. synthetic_true_means must be called "
+                    f"with n_views_used=x.shape[1] -- the generator's width "
+                    f"and the post-max_modalities width are not the same "
+                    f"thing.")
+            r_hat = arm_accuracies_from_means(x[T1:], y[T1:], true_means,
+                                              combo_masks)
+            combo_counts = np.full(len(combos), float(T2))
+        else:
+            r_hat, combo_counts = stage1_combo_rewards(x, y, est_centers, T1,
+                                                       combos, nviews)
         # Start every build from the free views, matching force_free.
         start_bits = sum(1 << i for i in free_indices) or 1
         if start_bits not in bit_index:
@@ -304,9 +372,15 @@ def run_alg_greedy_multiclass(x, y, centers, costs, T1, training_budget, rng,
         # 2^|S| submask walk _submasks_containing() performs over the full
         # action space -- and it is built without any enumeration.
         arm_bits = np.array(sorted(bit_index, key=lambda b: bit_index[b]))
-        sub_arms = [[int(k) for k in range(len(combos))
-                     if (arm_bits[k] & int(b)) == arm_bits[k]]
-                    for b in arm_bits]
+        # SKIPPED under the oracle: sub_arms exists only to serve the
+        # reward_update="subsets" replay, which an oracle never performs, and
+        # it is O(n_arms^2) -- the single most expensive line in this setup
+        # at full enumeration. Building it for a mode that cannot read it
+        # would be the dominant cost of an lp_full_opt run.
+        sub_arms = None if is_oracle else [
+            [int(k) for k in range(len(combos))
+             if (arm_bits[k] & int(b)) == arm_bits[k]]
+            for b in arm_bits]
     lambda_t = 0.0
 
     predictions = []
@@ -318,7 +392,20 @@ def run_alg_greedy_multiclass(x, y, centers, costs, T1, training_budget, rng,
     seen_masks = set()
     errors = 0
 
-    b_fixed =  training_remaining_budget / T2
+    # ── ORACLE LP, solved ONCE before the loop ("lp_full_opt" only) ──
+    # Exact arm values and a flat allowance mean nothing about this LP
+    # changes between rounds, so it is solved here and every Stage-2 round
+    # reduces to one draw from p_oracle. The allowance is the FLAT
+    # (training_budget - T1) / T2 and stays flat: "solve once" and "re-solve
+    # against what is left" cannot both hold, and this mode is the former by
+    # construction. That makes it the ceiling for NON-ADAPTIVE policies --
+    # it never looks at x_t or at surviving budget -- so the adaptive modes
+    # below may legitimately beat it. Same caveat core.optimal_static states.
+    p_oracle = None
+    if is_oracle:
+        p_oracle, lambda_t = linprog_policy_over_estimates(
+            r_hat, combo_cost, max(0.0, remaining_training_budget_per_sample))
+
     for t in range(T1, total_samples):
         round_idx = t - T1  # 0-based Stage-2 round, drives the log(t+1) bonus
 
@@ -326,13 +413,33 @@ def run_alg_greedy_multiclass(x, y, centers, costs, T1, training_budget, rng,
             # SAFE BUDGET CHECK (BwK-style absorbing fallback policy) --
             # same semantics as run_alg_multiclass's cheapest-combo branch.
             mask = free_only_mask.copy()
+        elif is_oracle:
+            # One draw from the frozen distribution. No UCB (the values are
+            # exact), no re-solve, no update afterwards.
+            mask = combo_masks[int(rng.choice(len(p_oracle), p=p_oracle))].copy()
         elif use_lp:
             ucb = r_hat + np.sqrt(alpha_ucb * np.log(round_idx + 2) / combo_counts)
-            # b_t = max(0.0, training_remaining_budget / max(1, total_samples - t))
-            b_t = b_fixed
-            i_lo, i_hi, p_hi, lambda_t = lp_policy_over_estimates(
-                ucb, combo_cost, cost_order, b_t)
-            j = i_hi if (p_hi > 0.0 and float(rng.random()) < p_hi) else i_lo
+            # ── ADAPTIVE PER-ROUND ALLOWANCE ──
+            # Recomputed EVERY round from the budget that actually survived,
+            # over the rounds that actually remain (total_samples - t counts
+            # the current round). Previously frozen at the pre-loop
+            # (training_budget - T1) / T2, which drifted out of date as soon
+            # as realized spend diverged from plan: overspend early and the
+            # LP kept prescribing an allowance the pool could no longer fund
+            # until the hard override below fired; underspend and budget was
+            # still sitting unused at the horizon.
+            #
+            # max(0.0, .) guards the negative case -- training_remaining_
+            # budget starts at training_budget - T1, which is already
+            # negative whenever Stage 1 was charged more than the whole
+            # training pool (large init_fraction at a small budget_fraction,
+            # a combination the init_fraction sweep does generate).
+            b_t = max(0.0, training_remaining_budget) / max(1, total_samples - t)
+            #i_lo, i_hi, p_hi, lambda_t = lp_policy_over_estimates(
+            #    ucb, combo_cost, cost_order, b_t)
+            #j = i_hi if (p_hi > 0.0 and float(rng.random()) < p_hi) else i_lo
+            p_lp, lambda_t = linprog_policy_over_estimates(ucb, combo_cost, b_t)
+            j = int(rng.choice(len(p_lp), p=p_lp))
             mask = combo_masks[j].copy()
         else:
             diff_mean_sq = pairwise_diff_sq_from_means(est_centers)  # (nv, nc, nc)
@@ -374,7 +481,12 @@ def run_alg_greedy_multiclass(x, y, centers, costs, T1, training_budget, rng,
         # Stage-1 arrays throughout, under every acquisition mode. Under
         # "greedy" there is nothing to update at all -- the oracle is
         # re-derived each round from those frozen arrays and the dual.
-        if use_lp:
+        # `not is_oracle`, NOT plain `use_lp`: lp_full_opt has an r_hat too,
+        # holding the exact true-means values. Averaging observed rewards
+        # into those would silently degrade the oracle into a drifting
+        # estimate of the FROZEN classifier's accuracy -- the run would still
+        # complete and the numbers would still look plausible.
+        if use_lp and not is_oracle:
             sel_bits = int(sum(1 << i for i in range(nviews) if mask[i]))
             if reward_update == "selected":
                 # BANDIT feedback: one observation per round, the played arm
@@ -437,6 +549,8 @@ def run_alg_greedy_multiclass(x, y, centers, costs, T1, training_budget, rng,
         'est_counts': est_counts,
         'acquisition': acquisition,
         'n_arms': (len(combos) if combos is not None else 0),
+        # None outside lp_full_opt; the frozen per-arm play distribution.
+        'oracle_probs': p_oracle,
         'avg_views_acquired': float(np.mean(views_trace)),
         'n_unique_masks': len(seen_masks),
     }

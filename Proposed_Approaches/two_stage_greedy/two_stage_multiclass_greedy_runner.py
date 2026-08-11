@@ -73,9 +73,11 @@ from core.multiclass_common import (
     initialize_centers_multiclass,
     run_inference_lp_dataset_colgen_multiclass,
 )
+from core.optimal_static import synthetic_true_means
 from core.two_stage_utils import calculate_two_stage_error
 from two_stage_greedy.two_stage_multiclass_greedy import (
     ACQUISITION_MODES,
+    ORACLE_ACQUISITION_MODES,
     REWARD_UPDATE_SCOPES,
     run_alg_greedy_multiclass,
 )
@@ -124,6 +126,20 @@ def run_experiment(
         raise ValueError(f"acquisition must be one of {ACQUISITION_MODES}, "
                          f"got {acquisition!r}")
 
+    if acquisition in ORACLE_ACQUISITION_MODES and dataset_name not in SYNTHETIC_DATASETS:
+        # Hoisted ABOVE load_dataset_as_numpy deliberately. The true-means
+        # recovery below has to wait for nviews, but this check does not, and
+        # a real-dataset load can be slow or can fail on its own (network
+        # fetch, missing cache) -- so the user would eat that wait, or a
+        # confusing ConnectionError, before reaching a rejection that was
+        # decidable from the flags alone.
+        raise ValueError(
+            f"acquisition={acquisition!r} needs the TRUE generative means, which "
+            f"exist only for the synthetic datasets {SYNTHETIC_DATASETS}; got "
+            f"{dataset_name!r}. Substituting a sample mean would turn the oracle "
+            f"into a plug-in estimate the learning modes can beat, which is worse "
+            f"than no ceiling at all. Use acquisition='lp_full' on real data.")
+
     X_full, Y_full, feature_names = load_dataset_as_numpy(
         dataset_name, max_modalities=max_modalities, data_path=data_path,
         max_samples=max_samples, synthetic_n_samples=synthetic_n_samples,
@@ -147,9 +163,37 @@ def run_experiment(
     print(f"feature_costs[0] (free) = {costs[0]}, paid costs (normalized, sum(costs)==1): "
           f"min={paid_costs.min():.4f}, max={paid_costs.max():.4f}, mean={paid_costs.mean():.4f}, "
           f"sum={paid_costs.sum():.4f}")
+    _has_ru = acquisition not in ("greedy",) + ORACLE_ACQUISITION_MODES
     print(f"Stage-2 acquisition={acquisition!r}, alpha_ucb={alpha_ucb:g}"
-          + (f", reward_update={reward_update!r}"
-             if acquisition != "greedy" else ""))
+          + (f", reward_update={reward_update!r}" if _has_ru else ""))
+
+    # ── ORACLE ACQUISITION SETUP (acquisition="lp_full_opt" only) ──
+    # Recovered ONCE per run: the generative means belong to the DATASET,
+    # not to a seed's split or a budget/init fraction, so every cell of the
+    # sweep shares them.
+    #
+    # n_views_used=nviews, NOT synthetic_n_views. load_dataset_as_numpy
+    # applies features[:, :max_modalities] to synthetic data too, so the
+    # generator's width and the width in X_full diverge whenever
+    # --max-modalities is set. synthetic_true_means has to draw at the FULL
+    # width and truncate after (numpy fills row-major), and nviews is what
+    # tells it where to cut. Passing synthetic_n_views as the used width
+    # instead yields plausible-looking but wrong means -- an oracle that has
+    # quietly stopped being one, with nothing visibly failing.
+    true_means = None
+    if acquisition in ORACLE_ACQUISITION_MODES:
+        # Dataset eligibility was already rejected above; this is the recovery,
+        # which needs nviews and so has to happen after the load.
+        true_means = synthetic_true_means(
+            dataset_name,
+            synthetic_n_views=synthetic_n_views,
+            n_views_used=nviews,
+            synthetic_seed=synthetic_seed,
+            mean_scale=synthetic_mean_scale,
+            n_classes=synthetic_n_classes,
+        )
+        print(f"  [oracle] recovered true means for acquisition={acquisition}: "
+              f"shape {true_means.shape}")
 
     all_results = []
 
@@ -188,6 +232,7 @@ def run_experiment(
                     x=X_train, y=Y_train, centers=centers, costs=costs,
                     T1=n_init_samples, training_budget=training_budget, rng=rng,
                     acquisition=acquisition, reward_update=reward_update,
+                    true_means=true_means,
                     alpha_ucb=alpha_ucb,
                     step_size=step_size, lambda_max=lambda_max,
                     pred_rule=pred_rule,
@@ -241,7 +286,7 @@ def run_experiment(
                     'init_fraction': init_fraction,
                     'Experts': np.nan,            # greedy enumerates nothing
                     'acquisition': acquisition,
-                    'reward_update': reward_update if acquisition != "greedy" else "",
+                    'reward_update': reward_update if _has_ru else "",
                     'n_arms': stage2_result.get('n_arms', 0),
                     'alpha_ucb': alpha_ucb,
                     'avg_views_acquired': stage2_result['avg_views_acquired'],
@@ -444,7 +489,9 @@ if __name__ == "__main__":
     # acquisition MUST be in the tag, or two runs differing only in policy
     # write the SAME auto-filename and silently clobber each other.
     cu_tag = f"_{args.acquisition}"
-    if args.acquisition != "greedy":
+    # No reward_update suffix for greedy (no arms) or the oracle modes (exact
+    # arm values, never scored) -- it would name a scoring scope that never ran.
+    if args.acquisition not in ("greedy",) + ORACLE_ACQUISITION_MODES:
         cu_tag += f"-{args.reward_update}"
     ti_tag = "_trainonly" if args.skip_inference else ""
     maxmod_label = "ALL" if max_modalities is None else str(max_modalities)
