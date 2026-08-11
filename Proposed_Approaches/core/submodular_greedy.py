@@ -19,11 +19,11 @@ methods run a bit-identical oracle. A copy that silently drifts would
 invalidate the experiment, so there is exactly one copy and both callers
 import it.
 
-`multiclass_risk` here and `core.lp_colgen.multiclass_reward` are the SAME
+`multiclass_reward` here and `core.lp_colgen.multiclass_reward` are the SAME
 formula (average pairwise Bhattacharyya accuracy proxy) under two names --
 lp_colgen's copy is kept separate because it is consumed by the LP
 branch-and-bound pricing routine and documented in that context. Both are
-verbatim ports of the notebook's `multiclass_risk`.
+verbatim ports of the notebook's `multiclass_reward`.
 
 === Deliberate changes vs. the notebook (see git history of
     gmm_multiclass_submodular.py for the originals) ===
@@ -135,18 +135,19 @@ MAX_REWARD_ESTIMATE_VIEWS = 20
 # minus the Bhattacharyya error bound; the name is kept for traceability).
 # ─────────────────────────────────────────────────────────────────────────
 @numba.njit
-def bhattacharyya_error_rate(diff_mean_sq_mat):
+def bhattacharyya_accuracy_proxy(diff_mean_sq_mat):
     d_norm = np.sum(diff_mean_sq_mat, axis=0)  # (nc, nc)
-    acc = np.exp(-0.125 * d_norm)  # 1/8 * |\delta\mu|^2
-    return np.maximum(1.0 - acc, 0.0)
+    # Bhattacharyya overlap-based proxy for classification error
+    error = np.exp(-0.125 * d_norm)  # 1/8 * |\delta\mu|^2
+    return np.maximum(1.0 - error, 0.0)
 
 
 @numba.njit
-def multiclass_risk(diff_mean_sq_mat):
+def multiclass_reward(diff_mean_sq_mat):
     nc = diff_mean_sq_mat.shape[1]
-    err_rate = bhattacharyya_error_rate(diff_mean_sq_mat)  # (nc, nc)
+    pairwise_acc = bhattacharyya_accuracy_proxy(diff_mean_sq_mat)  # (nc, nc)
     denom = 1.0 / nc / (nc - 1)
-    return 0.5 * denom * np.sum(err_rate)
+    return 0.5 * denom * np.sum(pairwise_acc)
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -208,7 +209,7 @@ def greedy_oracle(diff_mean_sq, costs, omd_lambda, remain_budget,
     # correct even when the gain is non-positive under force_free.
     for i in list(free_indices):
         tmp_select = sel_set + [i]
-        margin_gain = multiclass_risk(diff_mean_sq[np.array(tmp_select)]) - current_objective
+        margin_gain = multiclass_reward(diff_mean_sq[np.array(tmp_select)]) - current_objective
         if force_free or margin_gain > 0:
             sel_set.append(i)
             current_objective += margin_gain
@@ -222,7 +223,7 @@ def greedy_oracle(diff_mean_sq, costs, omd_lambda, remain_budget,
             cost_i = costs[i]
             if current_cost + cost_i <= remain_budget:
                 tmp_select = sel_set + [i]
-                margin_gain = multiclass_risk(diff_mean_sq[np.array(tmp_select)]) - current_objective
+                margin_gain = multiclass_reward(diff_mean_sq[np.array(tmp_select)]) - current_objective
                 # no zero-cost elements remain here; epsilon for safety
                 gain_ratio = margin_gain / (cost_i + 1e-9)
                 # only add it if the margin beats the shadow price
@@ -232,7 +233,7 @@ def greedy_oracle(diff_mean_sq, costs, omd_lambda, remain_budget,
         if best_add is not None:
             sel_set.append(best_add)
             current_cost += costs[best_add]
-            current_objective = multiclass_risk(diff_mean_sq[np.array(sel_set)])
+            current_objective = multiclass_reward(diff_mean_sq[np.array(sel_set)])
             avail_elements.remove(best_add)
         else:
             break
@@ -248,7 +249,7 @@ def greedy_oracle(diff_mean_sq, costs, omd_lambda, remain_budget,
         cost_i = costs[i]
         if 0 < cost_i <= remain_budget:
             tmp_giant_indices = copy_set + [i]
-            reward_with_giant = multiclass_risk(diff_mean_sq[np.array(tmp_giant_indices)])
+            reward_with_giant = multiclass_reward(diff_mean_sq[np.array(tmp_giant_indices)])
             if reward_with_giant > best_giant_reward:
                 best_giant_reward = reward_with_giant
                 best_single_item = i
@@ -298,13 +299,13 @@ def greedy_chain(centers, costs, free_indices, force_free=True):
 
     sel, objective = [], 0.0
     for i in list(free_indices):
-        gain = multiclass_risk(diff_mean_sq[np.array(sel + [i])]) - objective
+        gain = multiclass_reward(diff_mean_sq[np.array(sel + [i])]) - objective
         if force_free or gain > 0:
             sel.append(i)
             objective += gain
     if not sel:            # no free view in this cost model
         sel = [int(np.argmin(costs))]
-        objective = multiclass_risk(diff_mean_sq[np.array(sel)])
+        objective = multiclass_reward(diff_mean_sq[np.array(sel)])
         
 
     chain = [sorted(sel)]                                        # S_0
@@ -312,12 +313,12 @@ def greedy_chain(centers, costs, free_indices, force_free=True):
     while remaining:
         best_ratio, best_add = -np.inf, None
         for i in remaining:
-            gain = multiclass_risk(diff_mean_sq[np.array(sel + [i])]) - objective
+            gain = multiclass_reward(diff_mean_sq[np.array(sel + [i])]) - objective
             ratio = gain / (costs[i] + 1e-9)     # same 1e-9 as greedy_oracle
             if ratio > best_ratio:
                 best_ratio, best_add = ratio, i
         sel.append(best_add)
-        objective = multiclass_risk(diff_mean_sq[np.array(sel)])
+        objective = multiclass_reward(diff_mean_sq[np.array(sel)])
         remaining.remove(best_add)
         chain.append(sorted(sel))                                # S_1 .. S_p
 
