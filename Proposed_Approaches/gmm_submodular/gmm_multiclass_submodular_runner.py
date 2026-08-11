@@ -81,7 +81,7 @@ from gmm_submodular.gmm_multiclass_submodular import (
     ORACLE_ACQUISITION_MODES,
     REWARD_UPDATE_SCOPES,
     greedy_oracle,  # noqa: F401 -- re-exported
-    multiclass_risk,  # noqa: F401 -- re-exported
+    multiclass_reward,  # noqa: F401 -- re-exported
     pred_linear_cla,  # noqa: F401 -- re-exported
     run_training_phase,
     run_inference_phase,

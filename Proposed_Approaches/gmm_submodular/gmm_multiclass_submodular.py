@@ -69,7 +69,7 @@ bandit / submodular / two_stage experiments:
    est_means_init, e.g. nclasses distinct rows of X_train drawn once per
    seed) instead of the notebook's rng.normal weights.
 7. @numba.njit instead of bare @jit; Colab scaffolding removed.
-8. greedy_oracle, multiclass_risk and bhattacharyya_error_rate MOVED OUT of
+8. greedy_oracle, multiclass_reward and bhattacharyya_accuracy_proxy MOVED OUT of
    this file into core/submodular_greedy.py (and re-imported above), so
    two_stage/two_stage_multiclass_greedy.py shares one canonical oracle
    rather than a copy that could drift. The moved greedy_oracle gained a
@@ -204,14 +204,14 @@ from core.submodular_greedy import (
     ORACLE_ACQUISITION_MODES,      # noqa: F401 -- re-exported
     REWARD_UPDATE_SCOPES,          # noqa: F401 -- re-exported
     arm_accuracies_from_means,
-    bhattacharyya_error_rate,      # noqa: F401 -- re-exported
+    bhattacharyya_accuracy_proxy,      # noqa: F401 -- re-exported
     build_arm_tables,
     greedy_chain,
     greedy_oracle,
     lp_policy_over_estimates,
     linprog_policy_over_estimates,
     mask_to_bits,
-    multiclass_risk,               # noqa: F401 -- re-exported
+    multiclass_reward,               # noqa: F401 -- re-exported
 )
 from core.two_stage_utils import generate_view_combinations
 
