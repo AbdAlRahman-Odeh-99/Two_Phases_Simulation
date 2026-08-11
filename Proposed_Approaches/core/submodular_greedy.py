@@ -68,6 +68,7 @@ from __future__ import annotations
 
 import numba
 import numpy as np
+import scipy.optimize as opt
 
 from core.lp_colgen import pairwise_diff_sq_from_means
 
@@ -83,10 +84,40 @@ from core.lp_colgen import pairwise_diff_sq_from_means
 # ─────────────────────────────────────────────────────────────────────────
 
 # Which subset gets acquired each round. Identical meaning in both methods:
-#   greedy    per-round submodular greedy oracle (greedy_oracle below)
-#   lp_chain  per-round budgeted LP over the nviews+1 nested greedy chain
-#   lp_full   the same LP over the full 2^(nviews-1) enumeration
-ACQUISITION_MODES = ("greedy", "lp_chain", "lp_full")
+#   greedy       per-round submodular greedy oracle (greedy_oracle below)
+#   lp_chain     per-round budgeted LP over the nviews+1 nested greedy chain
+#   lp_full      the same LP over the full 2^(nviews-1) enumeration
+#   lp_full_opt  ORACLE ceiling for the lp_full family: the same full
+#                enumeration, but the arm values are the TRUE-means
+#                accuracies (no UCB, no estimation error), and the LP is
+#                solved ONCE before the round loop. Each round is then a
+#                single draw from that frozen distribution.
+ACQUISITION_MODES = ("greedy", "lp_chain", "lp_full", "lp_full_opt")
+
+# The modes that acquire from an ENUMERATED arm set via
+# linprog_policy_over_estimates. "greedy" is the only mode outside this set;
+# callers use it for their `use_lp` test so adding a fourth LP mode does not
+# mean revisiting five scattered `acquisition == "lp_chain" or ...` chains.
+LP_ACQUISITION_MODES = ("lp_chain", "lp_full", "lp_full_opt")
+
+# ORACLE modes. Three properties, all of which callers must respect:
+#   1. They REQUIRE true_means -- the caller must pass the generative means
+#      (core.optimal_static.synthetic_true_means), so they are defined for
+#      SYNTHETIC datasets only.
+#   2. Their LP is solved ONCE, before the round loop, at the FIXED average
+#      per-round allowance. There is nothing to re-solve: the arm values do
+#      not move, because they were never estimates.
+#   3. They keep NO reward estimate, so the per-round r_hat / combo_counts
+#      update must be SKIPPED (gate it on `not in ORACLE_ACQUISITION_MODES`,
+#      not merely on "an arm table exists").
+# What they do NOT change is the classifier: prediction still runs on the
+# method's own centres (learning est_means in gmm_multiclass_submodular,
+# frozen Stage-1 centres in two_stage_multiclass_greedy). The oracle enters
+# through the ACQUISITION policy alone, which is what keeps this on the same
+# axis as the other three modes and makes the comparison "what does not
+# knowing the arm values cost us?" rather than "what does not knowing
+# anything cost us?".
+ORACLE_ACQUISITION_MODES = ("lp_full_opt",)
 
 # How the per-arm reward estimates are scored, under the lp_* modes only.
 #   subsets   counterfactual replay of every arm contained in the played
@@ -112,25 +143,11 @@ def bhattacharyya_error_rate(diff_mean_sq_mat):
 
 @numba.njit
 def multiclass_risk(diff_mean_sq_mat):
-    """Average pairwise Bhattacharyya accuracy proxy over the views
-    included in diff_mean_sq_mat (axis 0). Monotone nondecreasing in the
-    included view set, which is what makes the greedy below a (1-1/e)-type
-    approximation and what the LP's branch-and-bound pruning bound relies
-    on.
-
-    NOTE (pre-existing, deliberately NOT "fixed"): the DIAGONAL of
-    diff_mean_sq_mat is zero for true squared mean differences, but the
-    callers pass an OPTIMISTIC tensor `diff_mean_sq + bonus` whose diagonal
-    is 2/sqrt(count) > 0. So err_rate's diagonal is nonzero in practice and
-    the sum below includes it. This is verbatim notebook behavior and it
-    inflates every subset's score by a roughly common factor, so it does
-    not change the argmax much -- but it is why absolute risk values are
-    not directly interpretable as accuracies.
-    """
-    nc = diff_mean_sq_mat.shape[1]
+    #nc = diff_mean_sq_mat.shape[1]
     err_rate = bhattacharyya_error_rate(diff_mean_sq_mat)  # (nc, nc)
-    denom = 1.0 / nc / (nc - 1)
-    return 0.5 * denom * np.sum(err_rate)  # half: off-diagonal double-count
+    return 0.5 * np.sum(err_rate)
+    #denom = 1.0 / nc / (nc - 1)
+    #return 0.5 * denom * np.sum(err_rate)
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -192,7 +209,8 @@ def greedy_oracle(diff_mean_sq, costs, omd_lambda, remain_budget,
     # correct even when the gain is non-positive under force_free.
     for i in list(free_indices):
         tmp_select = sel_set + [i]
-        margin_gain = multiclass_risk(diff_mean_sq[np.array(tmp_select)]) - current_objective
+        #OLD: margin_gain = multiclass_risk(diff_mean_sq[np.array(tmp_select)]) - current_objective
+        margin_gain = 1 - multiclass_risk(diff_mean_sq[np.array(tmp_select)]) - current_objective
         if force_free or margin_gain > 0:
             sel_set.append(i)
             current_objective += margin_gain
@@ -206,7 +224,8 @@ def greedy_oracle(diff_mean_sq, costs, omd_lambda, remain_budget,
             cost_i = costs[i]
             if current_cost + cost_i <= remain_budget:
                 tmp_select = sel_set + [i]
-                margin_gain = multiclass_risk(diff_mean_sq[np.array(tmp_select)]) - current_objective
+                #OLD: margin_gain = multiclass_risk(diff_mean_sq[np.array(tmp_select)]) - current_objective
+                margin_gain = 1 - multiclass_risk(diff_mean_sq[np.array(tmp_select)]) - current_objective
                 # no zero-cost elements remain here; epsilon for safety
                 gain_ratio = margin_gain / (cost_i + 1e-9)
                 # only add it if the margin beats the shadow price
@@ -216,7 +235,8 @@ def greedy_oracle(diff_mean_sq, costs, omd_lambda, remain_budget,
         if best_add is not None:
             sel_set.append(best_add)
             current_cost += costs[best_add]
-            current_objective = multiclass_risk(diff_mean_sq[np.array(sel_set)])
+            #OLD: current_objective = multiclass_risk(diff_mean_sq[np.array(sel_set)])
+            current_objective = 1 - multiclass_risk(diff_mean_sq[np.array(sel_set)])
             avail_elements.remove(best_add)
         else:
             break
@@ -232,7 +252,8 @@ def greedy_oracle(diff_mean_sq, costs, omd_lambda, remain_budget,
         cost_i = costs[i]
         if 0 < cost_i <= remain_budget:
             tmp_giant_indices = copy_set + [i]
-            reward_with_giant = multiclass_risk(diff_mean_sq[np.array(tmp_giant_indices)])
+            #OLD: reward_with_giant = multiclass_risk(diff_mean_sq[np.array(tmp_giant_indices)])
+            reward_with_giant = 1 - multiclass_risk(diff_mean_sq[np.array(tmp_giant_indices)])
             if reward_with_giant > best_giant_reward:
                 best_giant_reward = reward_with_giant
                 best_single_item = i
@@ -282,25 +303,29 @@ def greedy_chain(centers, costs, free_indices, force_free=True):
 
     sel, objective = [], 0.0
     for i in list(free_indices):
-        gain = multiclass_risk(diff_mean_sq[np.array(sel + [i])]) - objective
+        #OLD: gain = multiclass_risk(diff_mean_sq[np.array(sel + [i])]) - objective
+        gain = 1- multiclass_risk(diff_mean_sq[np.array(sel + [i])]) - objective
         if force_free or gain > 0:
             sel.append(i)
             objective += gain
     if not sel:            # no free view in this cost model
         sel = [int(np.argmin(costs))]
-        objective = multiclass_risk(diff_mean_sq[np.array(sel)])
+        #OLD: objective = multiclass_risk(diff_mean_sq[np.array(sel)])
+        objective = 1 - multiclass_risk(diff_mean_sq[np.array(sel)])
 
     chain = [sorted(sel)]                                        # S_0
     remaining = [i for i in range(nviews) if i not in sel]
     while remaining:
         best_ratio, best_add = -np.inf, None
         for i in remaining:
-            gain = multiclass_risk(diff_mean_sq[np.array(sel + [i])]) - objective
+            #OLD: gain = multiclass_risk(diff_mean_sq[np.array(sel + [i])]) - objective
+            gain = 1 - multiclass_risk(diff_mean_sq[np.array(sel + [i])]) - objective
             ratio = gain / (costs[i] + 1e-9)     # same 1e-9 as greedy_oracle
             if ratio > best_ratio:
                 best_ratio, best_add = ratio, i
         sel.append(best_add)
-        objective = multiclass_risk(diff_mean_sq[np.array(sel)])
+        #OLD: objective = multiclass_risk(diff_mean_sq[np.array(sel)])
+        objective = 1 - multiclass_risk(diff_mean_sq[np.array(sel)])
         remaining.remove(best_add)
         chain.append(sorted(sel))                                # S_1 .. S_p
 
@@ -371,6 +396,66 @@ def lp_policy_over_estimates(ucb, combo_cost, cost_order, budget_per_round):
     lam = 0.0 if span <= 0 else (y2 - y1) / span
     return i1, i2, float(min(max(p_hi, 0.0), 1.0)), float(max(lam, 0.0))
 
+def linprog_policy_over_estimates(ucb, combo_cost, budget_per_round):
+    """Exact optimum of the per-round budgeted LP over the ENUMERATED
+    combinations, solved with a general LP solver:
+
+        maximise    sum_c p_c * ucb_c
+        subject to  sum_c p_c * cost_c <= budget_per_round
+                    sum_c p_c = 1,  p >= 0
+
+    Returns (p, lam):
+        p    (n_combos,) probability vector -- SAMPLE from it. The previous
+             implementation returned a two-point mixture (idx_lo, idx_hi,
+             p_hi) because one inequality plus the simplex means SOME
+             optimal vertex has at most two nonzeros; the solver may
+             instead land on an interior optimal face when arms tie, so the
+             full vector is returned and callers draw from it.
+        lam  shadow price on the budget constraint, >= 0, taken from the
+             LP dual rather than a hull slope. Same meaning as before --
+             what the OMD dual was approximating -- so Lagrangian traces
+             stay comparable across acquisition modes.
+    """
+    ucb = np.asarray(ucb, dtype=np.float64).ravel()
+    combo_cost = np.asarray(combo_cost, dtype=np.float64).ravel()
+    n = ucb.shape[0]
+    b = max(0.0, float(budget_per_round))
+
+    res = opt.linprog(
+        -ucb,
+        A_ub=combo_cost.reshape(1, -1),
+        b_ub=np.array([b]),
+        A_eq=np.ones((1, n)),
+        b_eq=np.array([1.0]),
+        bounds=(0.0, 1.0),
+        method="highs",
+    )
+
+    if not res.success:
+        # Unreachable under this codebase's cost convention (the free-view
+        # arm has cost 0, so p = e_free is feasible at any b >= 0), but fall
+        # back to the cheapest arm explicitly rather than returning garbage.
+        p = np.zeros(n)
+        p[int(np.argmin(combo_cost))] = 1.0
+        return p, 0.0
+
+    p = np.clip(res.x, 0.0, None)
+    total = p.sum()
+    if total <= 0:
+        p = np.zeros(n)
+        p[int(np.argmin(combo_cost))] = 1.0
+    else:
+        p = p / total          # exact simplex sum, for rng.choice
+
+    # HiGHS reports d(objective)/d(b_ub) for the MINIMISED objective -ucb@p,
+    # so the marginal is <= 0 and its negation is the gain in expected ucb
+    # per unit of budget -- matching the old hull slope's sign convention.
+    lam = 0.0
+    marg = getattr(res, "ineqlin", None)
+    if marg is not None and len(marg.marginals):
+        lam = -float(marg.marginals[0])
+
+    return p, max(lam, 0.0)
 
 def build_arm_tables(combos, costs, nviews):
     """Bookkeeping shared by every enumerated-action-space caller.
@@ -422,3 +507,42 @@ def build_arm_tables(combos, costs, nviews):
 def mask_to_bits(mask):
     """0-indexed boolean view mask -> integer bitmask (bit i = view i)."""
     return int(sum(1 << i for i in range(len(mask)) if mask[i]))
+
+
+def arm_accuracies_from_means(X_rows, Y_rows, means, combo_masks):
+    """Per-arm EMPIRICAL nearest-centroid accuracy of `means`, restricted to
+    each arm's view set, measured on (X_rows, Y_rows).
+
+    This is the arm-value function for the ORACLE acquisition modes: pass
+    the TRUE generative means and the rows the policy is about to run over,
+    and the result is each subset's exact achievable accuracy -- the same
+    quantity r_hat is a running estimate of under lp_chain / lp_full, on the
+    same 0/1 scale, so an oracle run and a learning run are directly
+    comparable arm for arm.
+
+    Returns (n_arms,) float. An empty row set yields a flat chance-level
+    1/nclasses, which keeps the LP well posed (it then just buys the
+    cheapest arm) instead of raising inside the solver.
+    """
+    combo_masks = np.asarray(combo_masks, dtype=bool)
+    means = np.asarray(means, dtype=np.float64)
+    n_arms = combo_masks.shape[0]
+    nclasses = means.shape[0]
+
+    xs = np.asarray(X_rows, dtype=np.float64)
+    ys = np.asarray(Y_rows, dtype=int)
+    if len(xs) == 0:
+        return np.full(n_arms, 1.0 / nclasses, dtype=np.float64)
+    if means.shape[1] != combo_masks.shape[1]:
+        raise ValueError(
+            f"means has {means.shape[1]} views but combo_masks has "
+            f"{combo_masks.shape[1]}. Pass true means at the POST-truncation "
+            f"width -- see core.optimal_static.synthetic_true_means' "
+            f"n_views_used parameter, which exists for exactly this mismatch.")
+
+    acc = np.empty(n_arms, dtype=np.float64)
+    for j in range(n_arms):
+        m = combo_masks[j]
+        d = ((xs[:, None, m] - means[None, :, m]) ** 2).sum(axis=2)  # (n, nc)
+        acc[j] = float(np.mean(d.argmin(axis=1) == ys))
+    return acc
