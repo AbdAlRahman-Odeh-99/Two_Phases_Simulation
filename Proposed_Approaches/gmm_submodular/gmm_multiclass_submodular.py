@@ -181,11 +181,6 @@ import numba
 import numpy as np
 from sklearn.metrics import f1_score, roc_auc_score
 
-from core.lp_colgen import (
-    multiclass_reward,           # noqa: F401 -- canonical njit'd copy lives in core
-    pairwise_diff_sq_from_means,
-)
-
 # greedy_oracle and its pairwise-Bhattacharyya risk MOVED to
 # core/submodular_greedy.py so that two_stage/two_stage_multiclass_greedy.py
 # runs a BIT-IDENTICAL oracle (that module's docstring explains why this
@@ -203,15 +198,14 @@ from core.submodular_greedy import (
     MAX_REWARD_ESTIMATE_VIEWS,     # noqa: F401 -- re-exported
     ORACLE_ACQUISITION_MODES,      # noqa: F401 -- re-exported
     REWARD_UPDATE_SCOPES,          # noqa: F401 -- re-exported
+    pairwise_diff_sq_from_means,
     arm_accuracies_from_means,
-    bhattacharyya_accuracy_proxy,      # noqa: F401 -- re-exported
     build_arm_tables,
     greedy_chain,
     greedy_oracle,
     lp_policy_over_estimates,
     linprog_policy_over_estimates,
     mask_to_bits,
-    multiclass_reward,               # noqa: F401 -- re-exported
 )
 from core.two_stage_utils import generate_view_combinations
 
@@ -296,6 +290,66 @@ def replay_combo_rewards(X_rows, Y_rows, est_means, combo_masks):
         d = ((xs[:, None, m] - est_means[None, :, m]) ** 2).sum(axis=2)  # (n, nc)
         r_hat[j] = float(np.mean(d.argmin(axis=1) == ys))
     return r_hat, np.full(n_arms, float(len(xs)), dtype=np.float64)
+
+
+def replay_pool_rewards(X_rows, Y_rows, row_bits, est_means, combo_masks,
+                        arm_bits, need):
+    """CONTAINMENT REPLAY over the ACQUIRED-ROW POOL.
+
+    Generalises replay_combo_rewards from "the warmup rows, which observed
+    EVERYTHING" to "every past row, each carrying the mask that was
+    actually paid for". An arm is replayable on row i exactly when the
+    arm's views are a SUBSET of what row i observed:
+
+        (row_bits[i] & arm_bits[j]) == arm_bits[j]
+
+    which is the SAME containment test the per-round reward update already
+    applies to the played subset (see the reward_update="subsets" branch).
+    No view is ever read that was not bought, so this adds no information
+    the policy did not already have -- it stops DISCARDING information it
+    had.
+
+    WHY: seeding used to come from `warmup_rows` alone, i.e. `nclasses`
+    rows -- TWO rows in the 2-class runs. A newly appearing arm therefore
+    entered with count=2 and r_hat in {0, 0.5, 1}, giving it a UCB bonus
+    of sqrt(alpha * log(t) / 2) ~ 2.5 at t=800, an order of magnitude
+    above the [0,1] scale it is added to. Since lp_chain REBUILDS the
+    ladder every round (35-69 distinct ladders and 50-97 distinct arms
+    over a run), that spike fired repeatedly and the LP spent its rounds
+    on whichever arm was newest rather than best.
+
+    `need` restricts the work to arms whose statistics are genuinely
+    unknown; arms with persisted stats in arm_reward_stats are never
+    recomputed. That laziness is what pays for the larger pool -- the old
+    code replayed on EVERY rebuild and then threw the result away for
+    every already-known key.
+
+    NOTE the replay re-evaluates with the CURRENT est_means, so old pooled
+    rows are not stale, only more expensive. Capping the pool was measured
+    to make no difference (512 vs. the full 800 rows: identical results),
+    so no cap is imposed.
+
+    Falls back to chance at count 1 for an arm with no eligible row.
+    """
+    n_arms = combo_masks.shape[0]
+    nclasses = est_means.shape[0]
+    r_hat = np.full(n_arms, 1.0 / nclasses, dtype=np.float64)
+    counts = np.ones(n_arms, dtype=np.float64)
+    if len(X_rows) == 0:
+        return r_hat, counts
+    xs = np.asarray(X_rows, dtype=np.float64)
+    ys = np.asarray(Y_rows, dtype=int)
+    rb = np.asarray(row_bits, dtype=np.int64)
+    for j in need:
+        b = int(arm_bits[j])
+        elig = np.flatnonzero((rb & b) == b)
+        if elig.size == 0:
+            continue
+        m = combo_masks[j]
+        d = ((xs[elig][:, None, m] - est_means[None, :, m]) ** 2).sum(axis=2)
+        r_hat[j] = float(np.mean(d.argmin(axis=1) == ys[elig]))
+        counts[j] = float(elig.size)
+    return r_hat, counts
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -438,8 +492,19 @@ def run_training_phase(nviews, nclasses, costs, n_train, training_budget,
     b_allowance = spending_ratio
     p_oracle = None
     warmup_rows = []                  # warmup rounds that were FULLY observed
+    # ── ACQUIRED-ROW POOL (generalises warmup_rows; see replay_pool_rewards) ──
+    # (row index, observed-view bitmask) for every past round. Used to seed
+    # arms that appear mid-run, which under lp_chain's per-round ladder
+    # rebuild is a frequent event. GATED ON feedback == "full": the replay
+    # reads y_true, which is exactly what feedback="bandit" asserts is never
+    # revealed. Under bandit the warmup-only path is kept -- it leaks
+    # nclasses labels, as it always did, rather than up to n_train of them.
+    use_row_pool = (feedback == "full")
+    pool_rows = []
+    pool_bits = []
     views_trace = np.zeros(n_train)
     seen_masks = set()
+    selected_subsets = [None] * n_train
 
     # ── ORACLE SETUP (acquisition="lp_full_opt" only) ──
     # Everything this mode needs is known before round 0, so all of it
@@ -518,20 +583,32 @@ def run_training_phase(nviews, nclasses, costs, n_train, training_budget,
                 arm_bits = tables["arm_bits"]
                 bit_index = tables["bit_index"]
 
-                # Warmup replay provides initialization for subsets that have
-                # never appeared in an earlier chain.
-                seed_rewards, seed_counts = replay_combo_rewards(X_train[warmup_rows], Y_train[warmup_rows], est_means, combo_masks)
-
-                r_hat = np.empty(len(arm_bits), dtype=np.float64)
-                combo_counts = np.empty(len(arm_bits), dtype=np.float64)
-
-                for j, bits in enumerate(arm_bits):
-                    key = int(bits)
-
-                    if key not in arm_reward_stats:
+                # Initialization for subsets that have never appeared in an
+                # earlier chain. Only the UNKNOWN arms are seeded; anything
+                # already in arm_reward_stats keeps its accumulated history
+                # (the stats are keyed by bitmask, so an arm that drops off
+                # the ladder and returns is NOT reset).
+                need = [j for j, bits in enumerate(arm_bits)
+                        if int(bits) not in arm_reward_stats]
+                if need:
+                    if use_row_pool:
+                        seed_rewards, seed_counts = replay_pool_rewards(
+                            X_train[pool_rows], Y_train[pool_rows], pool_bits,
+                            est_means, combo_masks, arm_bits, need)
+                    else:
+                        # BANDIT path: warmup rows only, as before.
+                        seed_rewards, seed_counts = replay_combo_rewards(
+                            X_train[warmup_rows], Y_train[warmup_rows],
+                            est_means, combo_masks)
+                    for j in need:
+                        key = int(arm_bits[j])
                         arm_reward_stats[key] = float(seed_rewards[j])
                         arm_count_stats[key] = float(seed_counts[j])
 
+                r_hat = np.empty(len(arm_bits), dtype=np.float64)
+                combo_counts = np.empty(len(arm_bits), dtype=np.float64)
+                for j, bits in enumerate(arm_bits):
+                    key = int(bits)
                     r_hat[j] = arm_reward_stats[key]
                     combo_counts[j] = arm_count_stats[key]
 
@@ -564,11 +641,23 @@ def run_training_phase(nviews, nclasses, costs, n_train, training_budget,
         total_spent += inst_cost
         views_trace[t] = int(subset.sum())
         seen_masks.add(subset.tobytes())
+        # Record only after the budget fallback so warmup and normal rounds
+        # both reflect the subset that was actually acquired.
+        selected_subsets[t] = tuple((np.flatnonzero(subset) + 1).tolist())
         if is_init and subset.all():
             # Fully observed warmup round -> replayable. A warmup round that
             # was truncated to free views only is NOT recorded: its other
             # views were never paid for.
             warmup_rows.append(t)
+        if use_row_pool:
+            # Pool EVERY round with the mask that was ACTUALLY PAID FOR.
+            # Placed after the budget fallback, so `subset` is what was
+            # bought; the containment test at seeding time then guarantees
+            # no unpaid view is ever read. No selection bias: the mask
+            # depends on est_means and the UCB draw, never on x[t], so
+            # conditional on t the mask is independent of (x_t, y_t).
+            pool_rows.append(t)
+            pool_bits.append(mask_to_bits(subset))
 
         # observe acquired views only (features are semi-bandit in BOTH modes)
         x_obs = X_train[t, subset]
@@ -684,6 +773,7 @@ def run_training_phase(nviews, nclasses, costs, n_train, training_budget,
         "oracle_probs": p_oracle,
         "avg_views_acquired": float(np.mean(views_trace)),
         "n_unique_masks": len(seen_masks),
+        "selected_subsets": selected_subsets,
     }
 
 
