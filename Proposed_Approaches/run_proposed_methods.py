@@ -117,7 +117,7 @@ from core.datasets import (
     SYNTHETIC_N_VIEWS,
     SYNTHETIC_SEED,
 )
-from core.excel_utils import _style_sheet
+from core.excel_utils import _style_sheet, serialize_selected_subsets
 
 import gmm_submodular.gmm_multiclass_submodular_runner as multiclass_runner
 import two_stage_greedy.two_stage_multiclass_greedy_runner as two_stage_mc_greedy_runner
@@ -214,6 +214,8 @@ def _normalize_frac_keyed_results(results, budget_fractions, seeds, dataset_name
                 "Train Budget": r["train_budget"][i],
                 "Inference Budget": r["inference_budget"][i],
                 "Num Arms": r["n_arms"][i] if "n_arms" in r else np.nan,
+                "Selected Subsets": serialize_selected_subsets(
+                    r["selected_subsets"][i]),
             }
             rows.append(row)
     return rows
@@ -268,6 +270,10 @@ the same "greedy" / "lp_chain+subsets" / "lp_full+selected" strings
             "Train Budget": d["training_budget"],
             "Inference Budget": d["inference_budget"],
             "Num Arms": d.get("n_arms", np.nan),
+            "Selected Subsets": d.get(
+                "Selected Subsets",
+                serialize_selected_subsets(d.get("selected_subsets", [])),
+            ),
         })
     return rows
 
@@ -291,6 +297,7 @@ UNIFIED_COLUMNS = [
     # ONLY in the auto-generated filename, so two runs differing just in
     # alpha were indistinguishable once inside the workbook.
     "Alpha UCB",
+    "Selected Subsets",
 ]
 
 
@@ -465,7 +472,10 @@ def save_unified_results_to_excel(rows, filename):
     group_cols = ["Method", "Feedback", "Acquisition", "Alpha UCB",
                   "Num Classes", "Warm Start", "Dataset",
                   "Budget Fraction", "Init Fraction"]
-    numeric_cols = [c for c in UNIFIED_COLUMNS if c not in group_cols + ["Seed"]]
+    numeric_cols = [
+        c for c in UNIFIED_COLUMNS
+        if c not in group_cols + ["Seed", "Selected Subsets"]
+    ]
     summary = (
         df.groupby(group_cols, dropna=False)[numeric_cols]
         .agg(["mean", "std"])
@@ -508,7 +518,7 @@ if __name__ == "__main__":
                               "subsample; if the dataset already has fewer rows, all of them "
                               "are used). Ignored for synthetic datasets -- use --n-samples "
                               "instead.")
-    parser.add_argument("--budget-fractions", type=str, default="0.1,0.3,0.5,0.7,0.9")
+    parser.add_argument("--budget-fractions", type=str, default="0,0.1,0.3,0.5,0.7,0.9,1.1")
     parser.add_argument("--seeds", type=str, default="42,43,44,45,46,47,48,49,50,51")
     parser.add_argument("--n-init-fraction-points", type=int, default=10,
                          help="two_stage_greedy only: number of init_fraction (gamma) points swept "
