@@ -72,7 +72,7 @@ from core.datasets import (
     load_dataset_as_numpy,
     split_train_inference,
 )
-from core.excel_utils import _style_sheet
+from core.excel_utils import _style_sheet, serialize_selected_subsets
 from core.lp_colgen import solve_lp_policy_colgen_multiclass
 from core.optimal_static import synthetic_true_means
 
@@ -80,9 +80,6 @@ from gmm_submodular.gmm_multiclass_submodular import (
     ACQUISITION_MODES,
     ORACLE_ACQUISITION_MODES,
     REWARD_UPDATE_SCOPES,
-    greedy_oracle,  # noqa: F401 -- re-exported
-    multiclass_reward,  # noqa: F401 -- re-exported
-    pred_linear_cla,  # noqa: F401 -- re-exported
     run_training_phase,
     run_inference_phase,
 )
@@ -260,7 +257,7 @@ def run_experiment(
                "train_time_sec": [], "inference_time_sec": [], "seed_time_sec": [],
                "n_train": [], "n_inference": [],
                "train_budget": [], "inference_budget": [],
-               "n_arms": [], "avg_views_train": []}
+               "n_arms": [], "avg_views_train": [], "selected_subsets": []}
         for frac in budget_fractions
     }
 
@@ -363,6 +360,7 @@ def run_experiment(
             results[frac]["total_reward"].append(total_reward)
             results[frac]["n_arms"].append(ph1["n_arms"])
             results[frac]["avg_views_train"].append(ph1["avg_views_acquired"])
+            results[frac]["selected_subsets"].append(ph1["selected_subsets"])
             results[frac]["train_spent"].append(ph1["spent"])
             results[frac]["inference_spent"].append(ph2["spent"])
             results[frac]["num_masks_inference"].append(num_masks)
@@ -425,6 +423,8 @@ def save_results_to_excel(results, budget_fractions, dataset_name, feedback,
                 "Num Arms": r["n_arms"][i] if "n_arms" in r else np.nan,
                 "Avg Views Train": (r["avg_views_train"][i]
                                     if "avg_views_train" in r else np.nan),
+                "Selected Subsets": serialize_selected_subsets(
+                    r["selected_subsets"][i]),
             })
     df_detailed = pd.DataFrame(detailed_rows)
 
