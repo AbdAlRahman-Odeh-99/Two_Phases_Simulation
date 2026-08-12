@@ -79,7 +79,6 @@ from __future__ import annotations
 
 import numpy as np
 
-from core.lp_colgen import pairwise_diff_sq_from_means
 from core.two_stage_utils import generate_view_combinations
 from core.submodular_greedy import (
     # Shared policy vocabulary -- core is the canonical definition, so this
@@ -90,12 +89,12 @@ from core.submodular_greedy import (
     MAX_REWARD_ESTIMATE_VIEWS,   # noqa: F401 -- re-exported
     ORACLE_ACQUISITION_MODES,    # noqa: F401 -- re-exported
     REWARD_UPDATE_SCOPES,        # noqa: F401 -- re-exported
+    pairwise_diff_sq_from_means,
     arm_accuracies_from_means,
     greedy_chain,                # noqa: F401 -- re-exported (moved here)
     greedy_oracle,
     lp_policy_over_estimates,    # noqa: F401 -- re-exported (moved here)
     linprog_policy_over_estimates,
-    multiclass_reward,
 )
 
 # These six lived in two_stage/two_stage_multiclass.py until that module
@@ -390,6 +389,10 @@ def run_alg_greedy_multiclass(x, y, centers, costs, T1, training_budget, rng,
     lagrangian_reward_trace = []
     views_trace = []
     seen_masks = set()
+    # Stage 1 observes every modality by definition. Stage 2 entries are
+    # appended only after the hard remaining-budget fallback, so this is the
+    # actual acquired subset for every training sample, in training order.
+    selected_subsets = [tuple(range(1, nviews + 1)) for _ in range(T1)]
     errors = 0
 
     # ── ORACLE LP, solved ONCE before the loop ("lp_full_opt" only) ──
@@ -474,6 +477,7 @@ def run_alg_greedy_multiclass(x, y, centers, costs, T1, training_budget, rng,
         lagrangian_reward_trace.append(lagrangian_reward)
         views_trace.append(int(mask.sum()))
         seen_masks.add(mask.tobytes())
+        selected_subsets.append(tuple((np.flatnonzero(mask) + 1).tolist()))
         errors += int(y_hat != y_true)
 
         # ── ARM-REWARD update (lp_chain / lp_full only) ──
@@ -553,4 +557,5 @@ def run_alg_greedy_multiclass(x, y, centers, costs, T1, training_budget, rng,
         'oracle_probs': p_oracle,
         'avg_views_acquired': float(np.mean(views_trace)),
         'n_unique_masks': len(seen_masks),
+        'selected_subsets': selected_subsets,
     }

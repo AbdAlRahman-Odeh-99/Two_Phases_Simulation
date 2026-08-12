@@ -66,7 +66,7 @@ from core.datasets import (
     load_dataset_as_numpy,
     split_train_inference,
 )
-from core.excel_utils import _style_sheet
+from core.excel_utils import _style_sheet, serialize_selected_subsets
 
 from core.multiclass_common import (
     PRED_RULES,
@@ -217,8 +217,16 @@ def run_experiment(
 
             init_fractions = np.linspace(0, budget_fraction, n_init_fraction_points).tolist()
 
+            if budget_fraction == 0:
+                # Produce exactly one zero-budget baseline row.
+                init_fractions = [0.0]
+            else:
+                init_fractions = np.linspace(
+                    0, budget_fraction, n_init_fraction_points
+                ).tolist()
+
             for init_fraction in init_fractions:
-                if init_fraction >= budget_fraction:
+                if budget_fraction > 0 and init_fraction >= budget_fraction:
                     continue
 
                 n_init_samples = int(n_train * init_fraction)
@@ -291,6 +299,8 @@ def run_experiment(
                     'alpha_ucb': alpha_ucb,
                     'avg_views_acquired': stage2_result['avg_views_acquired'],
                     'n_unique_masks': stage2_result['n_unique_masks'],
+                    'Selected Subsets': serialize_selected_subsets(
+                        stage2_result['selected_subsets']),
                     'n_train': n_train,
                     'n_test': n_test,
                     'T1': n_init_samples,
