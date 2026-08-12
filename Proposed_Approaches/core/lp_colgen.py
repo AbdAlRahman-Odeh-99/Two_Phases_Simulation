@@ -49,7 +49,7 @@ import numba
 import numpy as np
 import scipy.optimize as opt
 from sklearn.metrics import f1_score, roc_auc_score
-
+from core.submodular_greedy import multiclass_reward, bhattacharyya_accuracy_proxy, pairwise_diff_sq_from_means
 
 @numba.njit
 def gain_func(snrs):
@@ -158,45 +158,6 @@ def solve_lp_policy_colgen(est_means, costs, inference_budget, n_inference, nois
 # above is duplicated from gmm_2class_submodular_asymmetric.py: the
 # algorithm modules import FROM core/, so core/ cannot import back from
 # them without a circular import. Keep the two copies in sync.
-
-
-@numba.njit
-def _bhattacharyya_pairwise_acc(diff_mean_sq_mat):
-    # Named "bhattacharyya_error_rate" in the original multiclass notebook,
-    # but note what it actually returns: exp(-0.125*d) is the Bhattacharyya
-    # bound on the PAIRWISE ERROR, so 1 - exp(-0.125*d) is the pairwise
-    # ACCURACY proxy being maximized. Verbatim notebook formula.
-    d_norm = np.sum(diff_mean_sq_mat, axis=0)  # (nc, nc)
-    acc = np.exp(-0.125 * d_norm)
-    return np.maximum(1.0 - acc, 0.0)
-
-
-@numba.njit
-def multiclass_reward(diff_mean_sq_mat):
-    """Verbatim port of the multiclass notebook's `multiclass_risk`:
-    0.5/(nc*(nc-1)) times the sum of the full pairwise accuracy-proxy
-    matrix (diagonal is zero; the full-matrix sum double-counts each
-    unordered pair, hence the extra 0.5). Monotone nondecreasing in the
-    set of included views (each view adds a nonnegative term to d_norm and
-    1 - exp(-0.125*d) is increasing in d), which is exactly the property
-    the branch-and-bound pricing bound below relies on -- same as
-    gain_func in the binary version."""
-    nc = diff_mean_sq_mat.shape[1]
-    err_rate = _bhattacharyya_pairwise_acc(diff_mean_sq_mat)
-    denom = 1.0 / nc / (nc - 1)
-    return 0.5 * denom * np.sum(err_rate)
-
-
-def pairwise_diff_sq_from_means(est_means):
-    """(nclasses, nviews) class means -> (nviews, nc, nc) tensor of squared
-    pairwise per-view mean differences, the input both multiclass_reward
-    and the multiclass greedy oracle consume. Matches the notebook's
-    construction: w_diff = weights.T[:,:,None] - weights.T[:,None,:];
-    diff_mean_sq = w_diff**2."""
-    mean_tr = np.asarray(est_means, dtype=np.float64).T  # (nviews, nc)
-    w_diff = mean_tr[:, :, None] - mean_tr[:, None, :]   # (nviews, nc, nc)
-    return np.square(w_diff)
-
 
 def solve_lp_policy_colgen_multiclass(est_means, costs, inference_budget,
                                        n_inference, thres=1e-6):

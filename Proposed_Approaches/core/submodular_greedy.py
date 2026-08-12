@@ -7,61 +7,6 @@ oracle and the pairwise-Bhattacharyya risk it maximizes. Previously these
 three functions lived inside gmm_submodular/gmm_multiclass_submodular.py;
 they were MOVED here (not duplicated) the moment a second method family --
 two_stage/two_stage_multiclass_greedy.py -- needed the same oracle.
-
-=== Why moved rather than duplicated ===
-This repo's usual convention is to DUPLICATE small helpers between
-independent method families rather than cross-import (see
-two_stage_multiclass.py's _macro_f1/_macro_ovr_auroc, which duplicate
-gmm_multiclass_submodular.py's). That convention is deliberately BROKEN
-here: two_stage_greedy exists specifically to answer "EXP4 vs. greedy,
-everything else held fixed", and that comparison is only valid if both
-methods run a bit-identical oracle. A copy that silently drifts would
-invalidate the experiment, so there is exactly one copy and both callers
-import it.
-
-`multiclass_reward` here and `core.lp_colgen.multiclass_reward` are the SAME
-formula (average pairwise Bhattacharyya accuracy proxy) under two names --
-lp_colgen's copy is kept separate because it is consumed by the LP
-branch-and-bound pricing routine and documented in that context. Both are
-verbatim ports of the notebook's `multiclass_reward`.
-
-=== Deliberate changes vs. the notebook (see git history of
-    gmm_multiclass_submodular.py for the originals) ===
-1. BUG FIX (carried over unchanged from gmm_multiclass_submodular.py's
-   module docstring, item 1): the notebook computed `final_indices =
-   free_indices + [best_single_item]` with free_indices a NUMPY ARRAY,
-   which performs elementwise ADDITION (np.array([0]) + [5] ->
-   array([5])), not list concatenation. free_indices is a Python list
-   here, restoring the intended "free views + the one giant item"
-   semantics.
-2. NEW: `force_free` (default True) -- the free (zero-cost) views are
-   ALWAYS included in the returned subset, instead of only when their
-   marginal gain is strictly positive. See the parameter's docstring for
-   why, and for why this is a no-op at alpha_ucb > 0.
-
-=== Second move: greedy_chain / lp_policy_over_estimates / build_arm_tables
-    (previously in two_stage/two_stage_multiclass_greedy.py) ===
-Same reasoning as the first move, one level up. `greedy_chain` (the nested
-action space) and `lp_policy_over_estimates` (the exact two-point solution
-of the per-round budgeted LP over an ENUMERATED arm set) were written for
-two_stage_greedy's center_update="reward_estimates" branch. They are now
-also the acquisition policy behind
-gmm_submodular/gmm_multiclass_submodular.run_training_phase's
-acquisition="lp_chain" / "lp_full" modes, and the whole point of those
-modes is "same action space and same LP, different learning setting", so
-a drifting copy would invalidate the comparison exactly as a drifting
-greedy_oracle would. two_stage_multiclass_greedy.py re-imports and
-re-exports both names, so its existing call sites are unchanged.
-
-`build_arm_tables` is NEW (not moved): it factors out the
-bit_index / combo_masks / combo_cost / cost_order / arm_bits bookkeeping
-that both callers need. two_stage_multiclass_greedy.py keeps its own
-inline construction so that branch stays byte-for-byte as it was; the
-helper is what the submodular caller uses. The one deliberate difference
-is that build_arm_tables does NOT precompute the sub_arms containment
-LIST -- that structure is O(n_arms^2) in memory and blows up on full
-enumeration -- callers get `arm_bits` and do the O(n_arms) vectorised
-`(arm_bits & played_bits) == arm_bits` test per round instead.
 """
 
 from __future__ import annotations
@@ -69,8 +14,6 @@ from __future__ import annotations
 import numba
 import numpy as np
 import scipy.optimize as opt
-
-from core.lp_colgen import pairwise_diff_sq_from_means
 
 # ─────────────────────────────────────────────────────────────────────────
 # Shared policy vocabulary. CANONICAL HOME: both method families
@@ -149,6 +92,15 @@ def multiclass_reward(diff_mean_sq_mat):
     denom = 1.0 / nc / (nc - 1)
     return 0.5 * denom * np.sum(pairwise_acc)
 
+def pairwise_diff_sq_from_means(est_means):
+    """(nclasses, nviews) class means -> (nviews, nc, nc) tensor of squared
+    pairwise per-view mean differences, the input both multiclass_reward
+    and the multiclass greedy oracle consume. Matches the notebook's
+    construction: w_diff = weights.T[:,:,None] - weights.T[:,None,:];
+    diff_mean_sq = w_diff**2."""
+    mean_tr = np.asarray(est_means, dtype=np.float64).T  # (nviews, nc)
+    w_diff = mean_tr[:, :, None] - mean_tr[:, None, :]   # (nviews, nc, nc)
+    return np.square(w_diff)
 
 # ─────────────────────────────────────────────────────────────────────────
 # Subset selection -- submodular greedy + giant-item check.
