@@ -17,6 +17,14 @@ from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 
 
+def serialize_selected_subsets(selected_subsets):
+    """Serialize 1-indexed training subsets into one Excel-safe string."""
+    return " | ".join(
+        ",".join(str(view) for view in subset)
+        for subset in selected_subsets
+    )
+
+
 def _style_sheet(ws):
     HEADER_FILL = PatternFill("solid", fgColor="2F5496")
     HEADER_FONT = Font(bold=True, color="FFFFFF", size=11)
@@ -44,5 +52,11 @@ def _style_sheet(ws):
         max_len = max(
             len(str(cell.value)) if cell.value is not None else 0 for cell in col
         )
-        ws.column_dimensions[get_column_letter(col[0].column)].width = max(max_len + 4, 14)
+        width = max(max_len + 4, 14)
+        if col[0].value == "Selected Subsets":
+            # A training trace can contain thousands of subsets. Keep the
+            # workbook usable instead of assigning a many-thousand-character
+            # display width; the full value remains in the cell/formula bar.
+            width = min(width, 80)
+        ws.column_dimensions[get_column_letter(col[0].column)].width = width
     ws.freeze_panes = "A2"
