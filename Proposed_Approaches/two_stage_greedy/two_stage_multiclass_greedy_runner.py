@@ -1,46 +1,7 @@
 """
 two_stage_multiclass_greedy_runner.py
 
-Driver for two_stage_multiclass_greedy.py. A near-clone of
-two_stage_multiclass_runner.py -- same data loading, same cost model, same
-80/20 split, same seeds x budget_fractions x init_fractions sweep, same row
-schema (so run_proposed_methods.normalize_two_stage_mc consumes it
-unchanged), same Excel output shape.
-
-=== Differences from two_stage_multiclass_runner.py ===
-1. NO expert enumeration. generate_view_combinations /
-   generate_combination_costs_heterogeneous are gone, and with them the
-   2^(nviews-1) blow-up: --max-modalities defaults to "all" here and the
-   MAX_RECOMMENDED_MODALITIES warning is dropped. The per-view `costs`
-   array the LP inference already needed is now ALSO what Stage-2 training
-   consumes. (nviews is still bounded in practice by what the Stage-2 LP
-   branch-and-bound pricing can handle -- the same regime submodular
-   runs in.)
-2. --warm-start and --gamma-max are gone (no expert weight vector, no
-   EXP4 exploration rate). --step-size / --lambda-max / --pred-rule are
-   unchanged -- the OMD dual and the decision rule are shared.
-3. New: --acquisition {greedy,lp_chain,lp_full}, --reward-update,
-   --alpha-ucb. There is deliberately NO warmup flag: Stage 1 IS the
-   warmup, and a second one measured harmful.
-4. Stage-2 INFERENCE uses the centres run_alg_greedy_multiclass RETURNS.
-   Every acquisition mode holds the classifier FROZEN at its Stage-1
-   values, so those are the Stage-1 centres by value -- reading them back
-   off the result dict is a no-op today, kept because it is the correct
-   contract if a learning mode is ever reintroduced.
-5. Extra columns: 'acquisition', 'avg_views_acquired', 'n_unique_masks',
-   'Experts' is emitted as NaN to keep the column
-   present and the two runners' frames concatenable.
-
-=== Column rename (breaking) ===
-The old 'center_update' and 'action_space' columns are GONE, replaced by
-a single 'acquisition' column. Workbooks written before this change do
-not concatenate directly; map center_update="frozen" -> "greedy" and
-center_update="reward_estimates" + action_space=X -> "lp_"+X, and drop
-rows from the four deleted centre-learning modes, which have no
-equivalent.
-
-Label matching, budget derivation, and the "Total Reward" convention are
-IDENTICAL to two_stage_multiclass_runner.py -- see that module's docstring.
+Driver for two_stage_multiclass_greedy.py.
 """
 
 from __future__ import annotations
@@ -78,6 +39,7 @@ from core.two_stage_utils import calculate_two_stage_error
 from two_stage_greedy.two_stage_multiclass_greedy import (
     ACQUISITION_MODES,
     ORACLE_ACQUISITION_MODES,
+    REWARD_ESTIMATES,
     REWARD_UPDATE_SCOPES,
     run_alg_greedy_multiclass,
 )
@@ -98,6 +60,7 @@ def run_experiment(
     synthetic_cluster_std=SYNTHETIC_CLUSTER_STD,
     synthetic_n_classes=SYNTHETIC_N_CLASSES,
     acquisition="greedy",
+    reward_estimate="biased",
     reward_update="subsets",
     alpha_ucb=2.0,
     step_size=1.0,
@@ -123,9 +86,16 @@ def run_experiment(
         msg = f"dataset_name must be one of {ALL_DATASETS}, got {dataset_name!r}"
         raise ValueError(msg)
     if acquisition not in ACQUISITION_MODES:
-        raise ValueError(f"acquisition must be one of {ACQUISITION_MODES}, "
-                         f"got {acquisition!r}")
-
+        raise ValueError(f"acquisition must be one of {ACQUISITION_MODES}, got {acquisition!r}")
+    if reward_update not in REWARD_UPDATE_SCOPES:
+        raise ValueError(f"reward_update must be one of {REWARD_UPDATE_SCOPES}, got {reward_update!r}")
+    # MEMBERSHIP check, matching gmm_multiclass_submodular_runner. Without
+    # it a misspelling ("unbaised") does not raise anywhere: every test
+    # downstream compares against the exact string "unbiased", so the run
+    # silently proceeds on the BIASED path while being reported -- and
+    # filenamed -- as whatever was passed.
+    if reward_estimate not in REWARD_ESTIMATES:
+        raise ValueError(f"reward_estimate must be one of {REWARD_ESTIMATES}, got {reward_estimate!r}")
     if acquisition in ORACLE_ACQUISITION_MODES and dataset_name not in SYNTHETIC_DATASETS:
         # Hoisted ABOVE load_dataset_as_numpy deliberately. The true-means
         # recovery below has to wait for nviews, but this check does not, and
@@ -163,9 +133,17 @@ def run_experiment(
     print(f"feature_costs[0] (free) = {costs[0]}, paid costs (normalized, sum(costs)==1): "
           f"min={paid_costs.min():.4f}, max={paid_costs.max():.4f}, mean={paid_costs.mean():.4f}, "
           f"sum={paid_costs.sum():.4f}")
-    _has_ru = acquisition not in ("greedy",) + ORACLE_ACQUISITION_MODES
-    print(f"Stage-2 acquisition={acquisition!r}, alpha_ucb={alpha_ucb:g}"
-          + (f", reward_update={reward_update!r}" if _has_ru else ""))
+
+
+
+    uses_reward_update = (acquisition in ("lp_chain", "lp_full") or (acquisition == "greedy" and reward_estimate == "unbiased"))
+    _has_ru = uses_reward_update
+    print(f"Stage-2 acquisition={acquisition!r}, "
+          f"reward_estimate={reward_estimate!r}, "
+          f"alpha_ucb={alpha_ucb:g}"
+          + (f", reward_update={reward_update!r}" if _has_ru else "")
+    )
+
 
     # ── ORACLE ACQUISITION SETUP (acquisition="lp_full_opt" only) ──
     # Recovered ONCE per run: the generative means belong to the DATASET,
@@ -240,6 +218,7 @@ def run_experiment(
                     x=X_train, y=Y_train, centers=centers, costs=costs,
                     T1=n_init_samples, training_budget=training_budget, rng=rng,
                     acquisition=acquisition, reward_update=reward_update,
+                    reward_estimate=reward_estimate,
                     true_means=true_means,
                     alpha_ucb=alpha_ucb,
                     step_size=step_size, lambda_max=lambda_max,
@@ -292,8 +271,9 @@ def run_experiment(
                     'nclasses': nclasses,
                     'budget_fraction': budget_fraction,
                     'init_fraction': init_fraction,
-                    'Experts': np.nan,            # greedy enumerates nothing
+                    'Experts': np.nan,            # legacy column; this method does not use EXP4 experts
                     'acquisition': acquisition,
+                    'reward_estimate': reward_estimate,
                     'reward_update': reward_update if _has_ru else "",
                     'n_arms': stage2_result.get('n_arms', 0),
                     'alpha_ucb': alpha_ucb,
@@ -389,9 +369,9 @@ if __name__ == "__main__":
     parser.add_argument("--dataset", choices=ALL_DATASETS, default="synthetic")
     parser.add_argument("--data-path", type=str, default=None)
     parser.add_argument("--max-modalities", type=str, default="all",
-                        help="Integer, or 'all' (DEFAULT) for no truncation. Unlike "
-                             "two_stage_multiclass_runner.py there is no 2^(nviews-1) expert "
-                             "enumeration here, so this no longer needs to be kept small.")
+                        help="Integer, or 'all'. Biased greedy itself does not enumerate subsets, "
+                             "but reward_estimate='unbiased' and lp_full require a full "
+                             "2^(nviews-1) table and therefore need small nviews.")
     parser.add_argument("--max-samples", type=int, default=None)
     parser.add_argument("--budget-fractions", type=str, default="0.1,0.3,0.5,0.7,0.9")
     parser.add_argument("--n-init-fraction-points", type=int, default=10)
@@ -414,16 +394,21 @@ if __name__ == "__main__":
                              "the small-nviews fidelity check for what the chain restriction "
                              "costs, capped at MAX_REWARD_ESTIMATE_VIEWS views. All three "
                              "hold the classifier frozen after Stage 1.")
+    parser.add_argument("--reward-estimate", choices=list(REWARD_ESTIMATES),
+                        default="biased",
+                        help="How greedy_oracle/greedy_chain value a subset. "
+                             "'biased': the Bhattacharyya surrogate computed "
+                             "from est_means (no data, no enumeration). "
+                             "'unbiased': a learned per-subset accuracy table "
+                             "maintained by the containment replay; needs "
+                             "2^(nviews-1) arms, so nviews must stay under "
+                             "MAX_REWARD_ESTIMATE_VIEWS.")
     parser.add_argument("--reward-update", choices=REWARD_UPDATE_SCOPES, default="subsets",
-                        help="--acquisition lp_chain / lp_full ONLY. 'subsets' (DEFAULT): "
-                             "counterfactual replay -- the acquired row was paid for on every "
-                             "selected view, so every SUB-combination of it is scored for "
-                             "free, giving 2^(|S|-1) observations per round instead of 1. "
-                             "Needs y_true, so it is FULL feedback. 'selected': update only "
-                             "the played combination from its 0/1 reward (bandit feedback); "
-                             "with the full action space this barely moves off the Stage-1 "
-                             "prior and is best treated as the ablation showing why replay "
-                             "matters. Inert under --acquisition greedy.")
+                        help="How empirical arm rewards are updated. "
+                             "'subsets' replays every arm contained in the acquired subset; "
+                             "'selected' updates only the played arm from its 0/1 reward. "
+                             "Used by lp_chain/lp_full and by greedy when --reward-estimate "
+                             "unbiased. Ignored by biased greedy and lp_full_opt.")
     parser.add_argument("--alpha-ucb", type=float, default=2.0,
                         help="Optimism scale in the exploration bonus "
                              "sqrt(alpha_ucb*log(t+1))/sqrt(count) (default 2.0, same as "
@@ -468,6 +453,7 @@ if __name__ == "__main__":
         synthetic_mean_scale=args.mean_scale,
         synthetic_n_classes=args.num_classes,
         acquisition=args.acquisition,
+        reward_estimate=args.reward_estimate,
         reward_update=args.reward_update,
         alpha_ucb=args.alpha_ucb,
         step_size=args.step_size,
@@ -496,17 +482,27 @@ if __name__ == "__main__":
     print(f"\nPer-seed wall-clock time (s): "
           f"{df.groupby('seed')['seed_time_sec'].first().to_dict()}")
 
-    # acquisition MUST be in the tag, or two runs differing only in policy
-    # write the SAME auto-filename and silently clobber each other.
-    cu_tag = f"_{args.acquisition}"
-    # No reward_update suffix for greedy (no arms) or the oracle modes (exact
-    # arm values, never scored) -- it would name a scoring scope that never ran.
-    if args.acquisition not in ("greedy",) + ORACLE_ACQUISITION_MODES:
-        cu_tag += f"-{args.reward_update}"
+
+    uses_reward_update = (args.acquisition in ("lp_chain", "lp_full") or (args.acquisition == "greedy"and args.reward_estimate == "unbiased"))
+    # Same scheme as run_proposed_methods.py and the submodular runner. The
+    # previous version appended --reward-update TWICE for lp_chain/lp_full
+    # (both the uses_reward_update test and the "not greedy" test fired),
+    # producing names like "..._lp_chain-subsets-subsets_biased...".
+    if args.acquisition in ORACLE_ACQUISITION_MODES:
+        cu_tag = f"_{args.acquisition}"
+    elif uses_reward_update:
+        cu_tag = f"_{args.acquisition}-{args.reward_update}"
+    elif args.acquisition != "greedy":
+        cu_tag = f"_{args.acquisition}"
+    else:
+        cu_tag = ""
     ti_tag = "_trainonly" if args.skip_inference else ""
     maxmod_label = "ALL" if max_modalities is None else str(max_modalities)
     pr_tag = "_pairwisevote" if args.pred_rule == "pairwise_vote" else ""
     au_tag = f"_alpha{args.alpha_ucb:g}" if args.alpha_ucb != 2.0 else ""
+    # ALWAYS tagged, including the "biased" default -- see the note in
+    # gmm_multiclass_submodular_runner.py. This CHANGES default filenames.
+    re_tag = f"_{args.reward_estimate}"
     classes_tag = ""
     if args.dataset in SYNTHETIC_DATASETS:
         n_classes = args.num_classes if args.dataset in MULTICLASS_SYNTHETIC_DATASETS else 2
@@ -515,7 +511,7 @@ if __name__ == "__main__":
         all_results, args.dataset,
         filename=args.output_xlsx or (
             f"results_two_stage_greedy_{args.dataset}_max{maxmod_label}"
-            f"_seeds{len(seeds)}{cu_tag}{ti_tag}{pr_tag}{au_tag}{classes_tag}.xlsx"
+            f"_seeds{len(seeds)}{cu_tag}{re_tag}{ti_tag}{pr_tag}{au_tag}{classes_tag}.xlsx"
         ),
     )
     print(f"Execution time: {time.time() - t0:.1f} seconds")
