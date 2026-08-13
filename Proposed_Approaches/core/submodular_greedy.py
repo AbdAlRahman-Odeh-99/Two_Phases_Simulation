@@ -15,98 +15,35 @@ import numba
 import numpy as np
 import scipy.optimize as opt
 
-# ─────────────────────────────────────────────────────────────────────────
-# Shared policy vocabulary. CANONICAL HOME: both method families
-# (gmm_submodular/gmm_multiclass_submodular.py and
-# two_stage_greedy/two_stage_multiclass_greedy.py) re-export these rather
-# than defining their own copies, because run_proposed_methods.py feeds ONE
-# --acquisition / --reward-update flag to both and the two methods must
-# agree on what the values mean. (Each module previously declared its own
-# REWARD_UPDATE_SCOPES; the driver had to assert they had not drifted. One
-# definition removes the need for the assert.)
-# ─────────────────────────────────────────────────────────────────────────
-
-# Which subset gets acquired each round. Identical meaning in both methods:
-#   greedy       per-round submodular greedy oracle (greedy_oracle below)
-#   lp_chain     per-round budgeted LP over the nviews+1 nested greedy chain
-#   lp_full      the same LP over the full 2^(nviews-1) enumeration
-#   lp_full_opt  ORACLE ceiling for the lp_full family: the same full
-#                enumeration, but the arm values are the TRUE-means
-#                accuracies (no UCB, no estimation error), and the LP is
-#                solved ONCE before the round loop. Each round is then a
-#                single draw from that frozen distribution.
 ACQUISITION_MODES = ("greedy", "lp_chain", "lp_full", "lp_full_opt")
-
-# The modes that acquire from an ENUMERATED arm set via
-# linprog_policy_over_estimates. "greedy" is the only mode outside this set;
-# callers use it for their `use_lp` test so adding a fourth LP mode does not
-# mean revisiting five scattered `acquisition == "lp_chain" or ...` chains.
 LP_ACQUISITION_MODES = ("lp_chain", "lp_full", "lp_full_opt")
-
-# ORACLE modes. Three properties, all of which callers must respect:
-#   1. They REQUIRE true_means -- the caller must pass the generative means
-#      (core.optimal_static.synthetic_true_means), so they are defined for
-#      SYNTHETIC datasets only.
-#   2. Their LP is solved ONCE, before the round loop, at the FIXED average
-#      per-round allowance. There is nothing to re-solve: the arm values do
-#      not move, because they were never estimates.
-#   3. They keep NO reward estimate, so the per-round r_hat / combo_counts
-#      update must be SKIPPED (gate it on `not in ORACLE_ACQUISITION_MODES`,
-#      not merely on "an arm table exists").
-# What they do NOT change is the classifier: prediction still runs on the
-# method's own centres (learning est_means in gmm_multiclass_submodular,
-# frozen Stage-1 centres in two_stage_multiclass_greedy). The oracle enters
-# through the ACQUISITION policy alone, which is what keeps this on the same
-# axis as the other three modes and makes the comparison "what does not
-# knowing the arm values cost us?" rather than "what does not knowing
-# anything cost us?".
 ORACLE_ACQUISITION_MODES = ("lp_full_opt",)
-
-# How the per-arm reward estimates are scored, under the lp_* modes only.
-#   subsets   counterfactual replay of every arm contained in the played
-#             set -- needs y_true, so this is FULL feedback
-#   selected  the played arm only, from its 0/1 reward -- BANDIT feedback
 REWARD_UPDATE_SCOPES = ("subsets", "selected")
-
-# Eager enumeration is 2^(nviews-1) arms; the ceiling for acquisition="lp_full".
 MAX_REWARD_ESTIMATE_VIEWS = 20
 
-
-# ─────────────────────────────────────────────────────────────────────────
-# Reward / risk -- verbatim notebook formulas (the notebook's "error rate"
-# is actually the pairwise ACCURACY proxy 1 - exp(-0.125 * d), i.e. one
-# minus the Bhattacharyya error bound; the name is kept for traceability).
-# ─────────────────────────────────────────────────────────────────────────
+# Reward
 @numba.njit
 def bhattacharyya_accuracy_proxy(diff_mean_sq_mat):
     d_norm = np.sum(diff_mean_sq_mat, axis=0)  # (nc, nc)
     # Bhattacharyya overlap-based proxy for classification error
     error = np.exp(-0.125 * d_norm)  # 1/8 * |\delta\mu|^2
     return np.maximum(1.0 - error, 0.0)
-
-
 @numba.njit
 def multiclass_reward(diff_mean_sq_mat):
     nc = diff_mean_sq_mat.shape[1]
     pairwise_acc = bhattacharyya_accuracy_proxy(diff_mean_sq_mat)  # (nc, nc)
     denom = 1.0 / nc / (nc - 1)
     return 0.5 * denom * np.sum(pairwise_acc)
-
 def pairwise_diff_sq_from_means(est_means):
-    """(nclasses, nviews) class means -> (nviews, nc, nc) tensor of squared
-    pairwise per-view mean differences, the input both multiclass_reward
-    and the multiclass greedy oracle consume. Matches the notebook's
-    construction: w_diff = weights.T[:,:,None] - weights.T[:,None,:];
-    diff_mean_sq = w_diff**2."""
     mean_tr = np.asarray(est_means, dtype=np.float64).T  # (nviews, nc)
     w_diff = mean_tr[:, :, None] - mean_tr[:, None, :]   # (nviews, nc, nc)
     return np.square(w_diff)
 
-# ─────────────────────────────────────────────────────────────────────────
-# Subset selection -- submodular greedy + giant-item check.
-# ─────────────────────────────────────────────────────────────────────────
+
+# Subset selection
 def greedy_oracle(diff_mean_sq, costs, omd_lambda, remain_budget,
-                  free_indices, force_free=True):
+                  free_indices, force_free=True,
+                  gain_func=None, empty_value=0.0):
     """
     Parameters
     ----------
@@ -125,48 +62,30 @@ def greedy_oracle(diff_mean_sq, costs, omd_lambda, remain_budget,
         Include every free view unconditionally, rather than only when its
         marginal gain is strictly positive.
 
-        Rationale: every OTHER acquisition path in this repo already
-        guarantees the free view is observed --
-        `core.two_stage_utils.generate_view_combinations` prepends view 1
-        to every EXP4 expert, and
-        `core.lp_colgen.solve_lp_policy_colgen_multiclass` seeds
-        free_mask[0]=True and only branches over PAID views. Without this
-        flag the greedy oracle was the one path that could return a subset
-        omitting the free view (or, if there were no free views at all, the
-        EMPTY subset -> an empty x_obs at prediction time), which would mean
-        two_stage and two_stage_greedy were being compared under
-        different observation models.
-
-        This is a NO-OP whenever the callers add a strictly positive
-        optimism bonus (alpha_ucb > 0), since then every single-view
-        marginal gain is strictly positive and the free views passed the
-        old `margin_gain > 0` test anyway. It only bites at alpha_ucb == 0
-        combined with a genuinely uninformative free view (identical class
-        means on it). Set force_free=False to recover the exact pre-move
-        behavior.
-
     Returns
     -------
     (nviews,) bool mask.
     """
+    if gain_func is None:
+        gain_func = lambda sel: multiclass_reward(diff_mean_sq[np.array(sel)])
     nview = len(costs)
     current_cost = 0.0
-    current_objective = 0.0
+    # Value of the EMPTY set. 0.0 is right for the Bhattacharyya surrogate
+    # (d=0 -> 1-exp(0)=0) but WRONG for a learned accuracy table, where the
+    # empty set scores chance = 1/nclasses. Leaving it at 0 inflates every
+    # first-view marginal gain and the ratio test passes for anything.
+    current_objective = empty_value
     sel_set = []
     avail_elements = set(range(nview))
-
     # Harvest from free views first. `margin_gain` is defined as
-    # risk(sel_set + [i]) - current_objective, so `current_objective +=
-    # margin_gain` is an exact identity, not an approximation -- it stays
-    # correct even when the gain is non-positive under force_free.
+    # risk(sel_set + [i]) - current_objective
     for i in list(free_indices):
         tmp_select = sel_set + [i]
-        margin_gain = multiclass_reward(diff_mean_sq[np.array(tmp_select)]) - current_objective
+        margin_gain = gain_func(tmp_select) - current_objective
         if force_free or margin_gain > 0:
             sel_set.append(i)
             current_objective += margin_gain
             avail_elements.remove(i)
-
     copy_set = list(sel_set)
     while avail_elements and current_cost < remain_budget:
         best_margin = -1
@@ -175,7 +94,7 @@ def greedy_oracle(diff_mean_sq, costs, omd_lambda, remain_budget,
             cost_i = costs[i]
             if current_cost + cost_i <= remain_budget:
                 tmp_select = sel_set + [i]
-                margin_gain = multiclass_reward(diff_mean_sq[np.array(tmp_select)]) - current_objective
+                margin_gain = gain_func(tmp_select) - current_objective
                 # no zero-cost elements remain here; epsilon for safety
                 gain_ratio = margin_gain / (cost_i + 1e-9)
                 # only add it if the margin beats the shadow price
@@ -185,11 +104,10 @@ def greedy_oracle(diff_mean_sq, costs, omd_lambda, remain_budget,
         if best_add is not None:
             sel_set.append(best_add)
             current_cost += costs[best_add]
-            current_objective = multiclass_reward(diff_mean_sq[np.array(sel_set)])
+            current_objective = gain_func(sel_set)
             avail_elements.remove(best_add)
         else:
             break
-
     # Giant item check
     greedy_solution_reward = current_objective
     greedy_solution_indices = list(sel_set)
@@ -201,45 +119,31 @@ def greedy_oracle(diff_mean_sq, costs, omd_lambda, remain_budget,
         cost_i = costs[i]
         if 0 < cost_i <= remain_budget:
             tmp_giant_indices = copy_set + [i]
-            reward_with_giant = multiclass_reward(diff_mean_sq[np.array(tmp_giant_indices)])
+            reward_with_giant = gain_func(tmp_giant_indices)
             if reward_with_giant > best_giant_reward:
                 best_giant_reward = reward_with_giant
                 best_single_item = i
-
     if best_single_item is not None and best_giant_reward > greedy_solution_reward:
-        # BUG FIX vs. the notebook: list concatenation, NOT numpy
-        # elementwise addition -- see module docstring, item 1.
         final_indices = list(copy_set) + [best_single_item]
     else:
         final_indices = greedy_solution_indices
-
     mask = np.array([idx in final_indices for idx in range(nview)]).astype("bool")
-
-    # Defensive: an all-False mask means an empty x_obs downstream. Under
-    # force_free with at least one free view this is unreachable (every
-    # repo dataset sets costs[0] == 0); the guard exists for the
-    # force_free=False / no-free-view configurations.
     if not mask.any():
         mask[int(np.argmin(costs))] = True
     return mask
 
 # ─────────────────────────────────────────────────────────────────────────
 # Enumerated action spaces + the per-round LP over reward estimates.
-# MOVED here from two_stage/two_stage_multiclass_greedy.py -- see the module
-# docstring's "Second move" section for why these are shared rather than
-# duplicated.
 # ─────────────────────────────────────────────────────────────────────────
-def greedy_chain(centers, costs, free_indices, force_free=True):
-    """The FROZEN GREEDY CHAIN: the nested action space that replaces the
+def greedy_chain(centers, costs, free_indices, force_free=True,
+                 gain_func=None, empty_value=0.0):
+    """The GREEDY CHAIN: the nested action space that replaces the
     full 2^(nviews-1) enumeration, cutting the arm count to nviews+1.
 
     Runs the same cost-benefit greedy as greedy_oracle above -- free views
     first, then repeatedly append the paid view with the best marginal-gain-
-    per-unit-cost -- but with NO budget cap and NO lambda threshold,
-    recording every intermediate set:
-
+    per-unit-cost:
         S_0 = {free views} subset S_1 subset ... subset S_p = everything
-
     Returns
     -------
     list of 1-INDEXED view tuples ordered by increasing size, so callers'
@@ -247,36 +151,33 @@ def greedy_chain(centers, costs, free_indices, force_free=True):
     generate_view_combinations' output format) consume it with no changes.
     """
     nviews = centers.shape[1]
-    diff_mean_sq = pairwise_diff_sq_from_means(centers)          # (nv, nc, nc)
-
-    sel, objective = [], 0.0
+    if gain_func is None:
+        diff_mean_sq = pairwise_diff_sq_from_means(centers)  # (nv, nc, nc)
+        gain_func = lambda sel: multiclass_reward(diff_mean_sq[np.array(sel)])
+    sel, objective = [], empty_value
     for i in list(free_indices):
-        gain = multiclass_reward(diff_mean_sq[np.array(sel + [i])]) - objective
+        gain = gain_func(sel + [i]) - objective
         if force_free or gain > 0:
             sel.append(i)
             objective += gain
     if not sel:            # no free view in this cost model
         sel = [int(np.argmin(costs))]
-        objective = multiclass_reward(diff_mean_sq[np.array(sel)])
-        
-
+        objective = gain_func(sel)
     chain = [sorted(sel)]                                        # S_0
     remaining = [i for i in range(nviews) if i not in sel]
     while remaining:
         best_ratio, best_add = -np.inf, None
         for i in remaining:
-            gain = multiclass_reward(diff_mean_sq[np.array(sel + [i])]) - objective
+            gain = gain_func(sel + [i]) - objective
             ratio = gain / (costs[i] + 1e-9)     # same 1e-9 as greedy_oracle
             if ratio > best_ratio:
                 best_ratio, best_add = ratio, i
         sel.append(best_add)
-        objective = multiclass_reward(diff_mean_sq[np.array(sel)])
+        objective = gain_func(sel)
         remaining.remove(best_add)
         chain.append(sorted(sel))                                # S_1 .. S_p
-
     chain.sort(key=len)
     return [tuple(v + 1 for v in s) for s in chain]              # 1-indexed
-
 
 def lp_policy_over_estimates(ucb, combo_cost, cost_order, budget_per_round):
     """Exact optimum of the per-round budgeted LP over the ENUMERATED
