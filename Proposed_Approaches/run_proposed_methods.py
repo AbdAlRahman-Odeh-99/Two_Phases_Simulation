@@ -6,22 +6,24 @@ methods -- each of which works on any registered dataset (the real
 AFA-Benchmark datasets, where nclasses is inferred from the labels, or the
 synthetic GMM datasets including synthetic) --
 
-    --method submodular       -> gmm_multiclass_submodular_runner.run_experiment
-    --method two_stage_greedy -> two_stage_multiclass_greedy_runner.run_experiment
+    --method adaptive       -> gmm_multiclass_adaptive_runner.run_experiment
+    --method two_stage -> two_stage_multiclass_greedy_runner.run_experiment
 
 -- and writes ONE Excel file with a unified row schema across both, so
 results from different methods can be concatenated/compared directly
 instead of living in differently-shaped workbooks.
 
 === Usage ===
-    python run_proposed_methods.py --method submodular --dataset synthetic --num-classes 4
-    python run_proposed_methods.py --method submodular --dataset ckd --feedback bandit
-    python run_proposed_methods.py --method submodular --dataset synthetic --acquisition lp_chain
-    python run_proposed_methods.py --method submodular --dataset synthetic --acquisition lp_full --reward-update selected --max-modalities 8
-    python run_proposed_methods.py --method two_stage_greedy --dataset synthetic --num-classes 3 --max-modalities 10
-    python run_proposed_methods.py --method two_stage_greedy --dataset actg175 --acquisition lp_chain
+    python run_proposed_methods.py --method adaptive --dataset synthetic --num-classes 4
+    python run_proposed_methods.py --method adaptive --dataset ckd --feedback bandit
+    python run_proposed_methods.py --method adaptive --dataset synthetic --acquisition lp_chain
+    python run_proposed_methods.py --method adaptive --dataset synthetic --acquisition lp_full --reward-update selected --max-modalities 8
+    python run_proposed_methods.py --method two_stage --dataset synthetic --num-classes 3 --max-modalities 10
+    python run_proposed_methods.py --method two_stage --dataset actg175 --acquisition lp_chain
     # oracle ceiling for lp_full (synthetic only -- it needs the generative means):
-    python run_proposed_methods.py --method submodular --dataset synthetic --acquisition lp_full_opt --max-modalities 8
+    python run_proposed_methods.py --method adaptive --dataset synthetic --acquisition lp_full_opt --max-modalities 8
+    python run_proposed_methods.py --method adaptive --dataset synthetic --acquisition ucb_argmax --max-modalities 8
+    python run_proposed_methods.py --method two_stage --dataset synthetic --acquisition ucb_argmax --max-modalities 8
 
 Run `python run_proposed_methods.py --help` for the full flag list.
 """
@@ -60,13 +62,29 @@ from core.multiclass_common import PRED_RULES
 from core.submodular_greedy import (
     ACQUISITION_MODES,
     ORACLE_ACQUISITION_MODES,
+    REWARD_ESTIMATES,
+    uses_empirical_arm_rewards as _uses_empirical_arm_rewards,
     REWARD_UPDATE_SCOPES,
 )
 
 
-METHODS = ("submodular", "two_stage_greedy")
-TWO_STAGE_FAMILY = ("two_stage_greedy",)
-DEFAULT_MAX_MODALITIES = {"submodular": None, "two_stage_greedy": None}
+METHODS = ("adaptive", "two_stage")
+TWO_STAGE_FAMILY = ("two_stage",)
+
+# FILENAME LABELS ONLY -- not the --method vocabulary, not the "Method"
+# column in the workbook. "two_stage" names the METHOD (two-stage,
+# with the greedy-family Stage 2 that replaced EXP4), but in a filename it
+# sits right next to the ACQUISITION tag, where it reads as though the run
+# used --acquisition greedy:
+#     results_two_stage_lp_chain-subsets_...   <- greedy or lp_chain?
+# The acquisition is now always tagged (see the filename block in __main__),
+# so the method half only has to identify the family:
+#     results_two_stage_lp_chain-subsets_...
+# --method still takes "two_stage", and the "Method" column still
+# reads "two_stage", so nothing that groups or filters on either
+# changes -- this is a rename of the default output PATH only.
+FILENAME_METHOD_LABELS = {"two_stage": "two_stage"}
+DEFAULT_MAX_MODALITIES = {"adaptive": None, "two_stage": None}
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -77,12 +95,12 @@ def _normalize_frac_keyed_results(results, budget_fractions, seeds, dataset_name
                                    feedback=np.nan, n_classes=2,
                                    acquisition=np.nan, reward_estimate=np.nan,
                                     alpha_ucb=np.nan):
-    """Normalizer for submodular's results dict, which has the shape
+    """Normalizer for adaptive's results dict, which has the shape
     {budget_fraction: {metric_name: [per-seed values]}}.
 
     feedback / n_classes / acquisition / alpha_ucb: experiment-level
     settings recorded per row. alpha_ucb is taken from the caller because
-    gmm_multiclass_submodular_runner does not put it in its results dict
+    gmm_multiclass_adaptive_runner does not put it in its results dict
     (unlike the two_stage runner, whose rows carry their own); it is the
     same value for every row of one run either way."""
     rows = []
@@ -98,7 +116,7 @@ def _normalize_frac_keyed_results(results, budget_fractions, seeds, dataset_name
                 "Reward Estimate": reward_estimate,
                 "Alpha UCB": alpha_ucb,
                 "Num Classes": n_classes,
-                "Warm Start": False,  # submodular has no warm-start concept
+                "Warm Start": False,  # adaptive has no warm-start concept
                 "Dataset": dataset_name,
                 "Seed": label,
                 "Budget Fraction": frac,
@@ -131,7 +149,7 @@ def _normalize_frac_keyed_results(results, budget_fractions, seeds, dataset_name
 
 
 def normalize_two_stage(all_results, dataset_name,
-                        method_name="two_stage_greedy", acquisition=np.nan,
+                        method_name="two_stage", acquisition=np.nan,
                         reward_estimate=np.nan, alpha_ucb=np.nan):
     """Normalizer for two_stage_multiclass_runner's flat list-of-dicts
     results. Num Classes is read from each row's own 'nclasses' (inferred
@@ -143,9 +161,9 @@ def normalize_two_stage(all_results, dataset_name,
     that sweeps alpha per row is reported correctly.
 
     acquisition: the run's acquisition policy as one string, for the
-    shared 'Acquisition' column -- two_stage_greedy passes
+    shared 'Acquisition' column -- two_stage passes
 the same "greedy" / "lp_chain+subsets" / "lp_full+selected" strings
-    submodular reports, since both methods now share the axis."""
+    adaptive reports, since both methods now share the axis."""
     rows = []
     for d in all_results:
         rows.append({
@@ -205,8 +223,8 @@ UNIFIED_COLUMNS = [
 ]
 
 
-def _acquisition_label(acquisition, reward_update, reward_estimate="biased"):
-    uses_reward_update = (acquisition in ("lp_chain", "lp_full") or (acquisition == "greedy" and reward_estimate == "unbiased"))
+def _acquisition_label(acquisition, reward_update, reward_estimate="surrogate"):
+    uses_reward_update = _uses_empirical_arm_rewards(acquisition, reward_estimate)
     if not uses_reward_update:
         return acquisition
     return f"{acquisition}+{reward_update}"
@@ -223,7 +241,7 @@ def run_method(method, dataset, max_modalities, seeds, budget_fractions,
                 step_size=1.0, lambda_max=10.0,
                 run_inference=True, image_pool_side=DEFAULT_IMAGE_POOL_SIDE,
                 image_data_home=None, pred_rule="nearest_center",
-                reward_update="subsets", reward_estimate="biased",
+                reward_update="subsets", reward_estimate="surrogate",
                 alpha_ucb=2.0, lr=1e-2,
                 acquisition="greedy"):
     
@@ -236,7 +254,7 @@ def run_method(method, dataset, max_modalities, seeds, budget_fractions,
         synthetic_seed=synthetic_seed, synthetic_mean_scale=synthetic_mean_scale,
     )
 
-    uses_empirical_arm_rewards = (acquisition in ("lp_chain", "lp_full") or (acquisition == "greedy" and reward_estimate == "unbiased"))
+    uses_empirical_arm_rewards = _uses_empirical_arm_rewards(acquisition, reward_estimate)
     if (acquisition in ORACLE_ACQUISITION_MODES and reward_update != "subsets"):
         print(
             f"WARNING: --reward-update has no effect under --acquisition "
@@ -248,17 +266,17 @@ def run_method(method, dataset, max_modalities, seeds, budget_fractions,
             "WARNING: --reward-update has no effect for this acquisition/"
             "reward-estimate combination; ignored."
         )
-    if acquisition in ORACLE_ACQUISITION_MODES and method == "submodular" and feedback != "full":
+    if acquisition in ORACLE_ACQUISITION_MODES and method == "adaptive" and feedback != "full":
         print(f"NOTE: --acquisition {acquisition} gives the ACQUISITION policy "
               f"the true means; the classifier still learns under --feedback "
               f"{feedback}. This is not an oracle-classifier run.")
-    if method != "submodular" and feedback != "full":
+    if method != "adaptive" and feedback != "full":
         print("WARNING: --feedback governs the CENTRE update, which only "
-              "submodular has (two_stage_greedy holds its Stage-1 centres "
+              "adaptive has (two_stage holds its Stage-1 centres "
               f"frozen); ignored for {method!r}. The arm-scoring analogue is "
               "--reward-update subsets/selected.")
-    if method != "submodular" and lr != 1e-2:
-        print("WARNING: --lr is the complementary-label step in submodular's "
+    if method != "adaptive" and lr != 1e-2:
+        print("WARNING: --lr is the complementary-label step in adaptive's "
               f"--feedback bandit centre update; ignored for {method!r}, whose "
               "centres are frozen.")
     if method not in TWO_STAGE_FAMILY:
@@ -266,12 +284,12 @@ def run_method(method, dataset, max_modalities, seeds, budget_fractions,
             print("WARNING: --step-size / --lambda-max only apply to "
                   f"{TWO_STAGE_FAMILY}; ignored for {method!r}.")
         if pred_rule != "nearest_center":
-            print(f"WARNING: --pred-rule only applies to --method two_stage_greedy; "
-                  f"ignored for {method!r} (submodular always uses its own "
+            print(f"WARNING: --pred-rule only applies to --method two_stage; "
+                  f"ignored for {method!r} (adaptive always uses its own "
                   f"pairwise-vote rule, which is what --pred-rule pairwise_vote "
                   f"makes two_stage match).")
 
-    if method == "submodular":
+    if method == "adaptive":
         results = multiclass_runner.run_experiment(
             dataset, feedback=feedback,
             acquisition=acquisition, reward_update=reward_update,
@@ -287,14 +305,14 @@ def run_method(method, dataset, max_modalities, seeds, budget_fractions,
         else:
             n_classes = DATASET_N_CLASSES.get(dataset, 2)
         return _normalize_frac_keyed_results(
-            results, budget_fractions, seeds, dataset, "submodular",
+            results, budget_fractions, seeds, dataset, "adaptive",
             feedback=feedback, n_classes=n_classes,
             acquisition=_acquisition_label(acquisition, reward_update, reward_estimate),
             reward_estimate=reward_estimate,
             alpha_ucb=alpha_ucb,
         )
 
-    if method == "two_stage_greedy":
+    if method == "two_stage":
         all_results = two_stage_mc_greedy_runner.run_experiment(
             dataset, n_init_fraction_points=n_init_fraction_points,
             synthetic_n_classes=synthetic_n_classes,
@@ -307,7 +325,7 @@ def run_method(method, dataset, max_modalities, seeds, budget_fractions,
             **common_kwargs
         )
         return normalize_two_stage(
-            all_results, dataset, "two_stage_greedy",
+            all_results, dataset, "two_stage",
             acquisition=_acquisition_label(acquisition, reward_update, reward_estimate),
             reward_estimate=reward_estimate,
             alpha_ucb=alpha_ucb,
@@ -347,7 +365,7 @@ def save_unified_results_to_excel(rows, filename):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Run one proposed MULTICLASS AFA method (submodular / two_stage) on a "
+        description="Run one proposed MULTICLASS AFA method (adaptive / two_stage) on a "
                      "real AFA-Benchmark or synthetic dataset, and write results in one unified "
                      "schema."
     )
@@ -370,8 +388,8 @@ if __name__ == "__main__":
     parser.add_argument("--budget-fractions", type=str, default="0,0.1,0.3,0.5,0.7,0.9,1.1")
     parser.add_argument("--seeds", type=str, default="42,43,44,45,46,47,48,49,50,51")
     parser.add_argument("--n-init-fraction-points", type=int, default=10,
-                         help="two_stage_greedy only: number of init_fraction (gamma) points swept "
-                              "per budget fraction. Ignored for submodular.")
+                         help="two_stage only: number of init_fraction (gamma) points swept "
+                              "per budget fraction. Ignored for adaptive.")
     parser.add_argument("--n-samples", type=int, default=SYNTHETIC_N_SAMPLES,
                          help="synthetic datasets only: how many rows to generate. Ignored for "
                               "real datasets.")
@@ -389,9 +407,9 @@ if __name__ == "__main__":
                               "If given explicitly, that path is used as-is (NOT forced under "
                               "results/).")
     parser.add_argument("--feedback", choices=("full", "bandit"), default="full",
-                         help="submodular only: how the CENTRES are updated. 'full' reveals "
+                         help="adaptive only: how the CENTRES are updated. 'full' reveals "
                               "y_true every round; 'bandit' observes only the one-bit "
-                              "correct/incorrect reward. No counterpart in two_stage_greedy, "
+                              "correct/incorrect reward. No counterpart in two_stage, "
                               "whose centres are frozen after Stage 1 -- there the full/bandit "
                               "distinction lives entirely in --reward-update. NOTE: --feedback "
                               "bandit is INCOMPATIBLE with --reward-update subsets (the replay "
@@ -414,57 +432,80 @@ if __name__ == "__main__":
                               "price of LEARNING the arm values, holding action space and LP "
                               "fixed. SYNTHETIC DATASETS ONLY (there is no true mean for real "
                               "data); --reward-update and --alpha-ucb are both inert under it. "
-                              "It does NOT give the classifier the true means -- submodular "
-                              "still learns centres under --feedback, two_stage_greedy still "
+                              "It does NOT give the classifier the true means -- adaptive "
+                              "still learns centres under --feedback, two_stage still "
                               "predicts with its Stage-1 centres -- so it is a ceiling on the "
                               "acquisition axis alone. Being non-adaptive by construction (it "
                               "never looks at x_t or at surviving budget), the ADAPTIVE modes "
                               "may legitimately score above it; see core/optimal_static.py's "
                               "'IS NOT a bound for ADAPTIVE acquisition' note. "
                               "BOTH methods take these four names verbatim -- there "
-                              "is no per-method translation. For two_stage_greedy all three "
+                              "is no per-method translation. For two_stage all three "
                               "hold the Stage-1 centres FROZEN, which is what makes them a "
                               "clean one-axis comparison; the four learning-centre modes it "
                               "used to carry (reward_full / reward_bandit / full / bandit) "
-                              "have been REMOVED -- see that module's HISTORY docstring.")
-    parser.add_argument("--reward-estimate", choices=["biased", "unbiased"],
-                        default="biased",
-                        help="How greedy_oracle/greedy_chain value a subset. "
-                             "'biased': the Bhattacharyya surrogate computed "
-                             "from est_means (no data, no enumeration). "
-                             "'unbiased': a learned per-subset accuracy table "
-                             "maintained by the containment replay; needs "
-                             "2^(nviews-1) arms, so nviews must stay under "
-                             "MAX_REWARD_ESTIMATE_VIEWS.")
+                              "have been REMOVED -- see that module's HISTORY docstring. "
+                              "'ucb_argmax': the NOTEBOOK rule "
+                              "(multiclass_supervised_unbiased_adaptive.ipynb's "
+                              "sim_unbiased). Same FULL 2^(nviews-1) arm table and same "
+                              "empirical UCB estimates as lp_full, but the per-round policy "
+                              "is a DETERMINISTIC Lagrangian argmax -- argmax_S r_hat[S] - "
+                              "lambda*cost(S) + bonus[S] -- with greedy's OMD dual in place "
+                              "of the LP's shadow price, so it commits to a single subset "
+                              "each round instead of sampling from a mixture. ucb_argmax "
+                              "minus lp_full is therefore the price of that commitment, "
+                              "holding action space and reward table fixed, just as "
+                              "lp_full_opt minus lp_full is the price of learning the arm "
+                              "values. --reward-update is live for it (the containment "
+                              "replay is what fills the table); --reward-estimate is inert, "
+                              "since the empirical table is unconditional. Capped at "
+                              "MAX_REWARD_ESTIMATE_VIEWS views like lp_full, and works on "
+                              "REAL data (nothing oracle about it).")
+    parser.add_argument("--reward-estimate",
+                        choices=list(REWARD_ESTIMATES),
+                        default="surrogate",
+                        help="What the per-arm reward estimates ARE. "
+                             "'surrogate': the closed-form Bhattacharyya "
+                             "proxy computed from the estimated means -- "
+                             "needs no observations and no enumeration. "
+                             "'empirical': a measured per-subset accuracy "
+                             "table filled in by the containment replay; "
+                             "needs 2^(nviews-1) arms, so nviews must stay "
+                             "under MAX_REWARD_ESTIMATE_VIEWS. RENAMED from "
+                             "biased/unbiased, which are NO LONGER ACCEPTED, "
+                             "because 'unbiased' also names the "
+                             "containment-replay acquisition (--acquisition "
+                             "ucb_argmax, from sim_unbiased) and the two are "
+                             "unrelated.")
     parser.add_argument("--num-classes", type=int, default=SYNTHETIC_N_CLASSES,
                          help="synthetic only: how many classes to generate "
                               "(labels {0..K-1}). Every other dataset infers its class "
                               "count from the labels.")
     parser.add_argument("--step-size", type=float, default=1.0,
-                         help="two_stage_greedy only: Stage-2 OMD dual (lambda) ascent step size "
-                              "(default 1.0). Ignored for submodular.")
+                         help="two_stage only: Stage-2 OMD dual (lambda) ascent step size "
+                              "(default 1.0). Ignored for adaptive.")
     parser.add_argument("--lambda-max", type=float, default=10.0,
-                         help="two_stage_greedy only: Stage-2 OMD dual variable clip ceiling "
-                              "(default 10.0). Ignored for submodular.")
+                         help="two_stage only: Stage-2 OMD dual variable clip ceiling "
+                              "(default 10.0). Ignored for adaptive.")
     parser.add_argument("--reward-update", choices=REWARD_UPDATE_SCOPES, default="subsets",
                          help="BOTH methods: how empirical arm rewards are updated. "
                               "'subsets' replays every arm contained in the acquired "
                               "subset; 'selected' updates only the played arm from its "
-                              "0/1 reward. Used by lp_chain/lp_full and by greedy when "
-                              "--reward-estimate unbiased. Ignored by biased greedy and "
-                              "lp_full_opt.")
+                              "0/1 reward. Used by lp_chain/lp_full/ucb_argmax and by "
+                              "greedy when --reward-estimate empirical. Ignored by "
+                              "surrogate greedy and lp_full_opt.")
     parser.add_argument("--alpha-ucb", type=float, default=2.0,
                          help="BOTH methods: optimism scale in the "
                               "bonus sqrt(alpha_ucb*log(t+1))/sqrt(count) (default 2.0). 0 "
-                              "disables optimism. NOTE on two_stage_greedy: its centres are "
+                              "disables optimism. NOTE on two_stage: its centres are "
                               "frozen and stage1_counts is identical across views, so the "
                               "bonus adds the SAME constant to every view -- it acts as a "
                               "slowly growing preference for larger view sets, not as "
-                              "per-view optimism. Only on submodular, whose counts genuinely "
+                              "per-view optimism. Only on adaptive, whose counts genuinely "
                               "diverge across views, does it steer WHICH view to explore.")
     parser.add_argument("--lr", type=float, default=1e-2,
-                         help="submodular --feedback bandit only: the complementary-label "
-                              "gradient step (default 1e-2). Ignored for two_stage_greedy, "
+                         help="adaptive --feedback bandit only: the complementary-label "
+                              "gradient step (default 1e-2). Ignored for two_stage, "
                               "whose centres never move.")
     parser.add_argument("--skip-inference", action="store_true",
                          help="Run ONLY Stage 1 + Stage 2 training; skip the Stage-2 LP "
@@ -488,27 +529,30 @@ if __name__ == "__main__":
                               "at your project/scratch space if the default location itself lacks "
                               "quota. Ignored for non-image datasets.")
     parser.add_argument("--pred-rule", choices=PRED_RULES, default="nearest_center",
-                         help="two_stage_greedy only: hard-decision prediction rule. "
+                         help="two_stage only: hard-decision prediction rule. "
                               "'nearest_center' (default; two_stage's original K-way argmin) or "
-                              "'pairwise_vote' (submodular's one-vs-one linear-discriminant "
+                              "'pairwise_vote' (adaptive's one-vs-one linear-discriminant "
                               "vote). NOTE: these are mathematically EQUIVALENT given the same "
                               "observed views (pairwise vote reduces exactly to nearest-centroid), "
                               "so this does NOT change accuracy -- it exists to confirm "
-                              "two_stage_greedy and submodular share a decision rule. Ignored for "
-                              "submodular (which always uses pairwise-vote intrinsically).")
+                              "two_stage and adaptive share a decision rule. Ignored for "
+                              "adaptive (which always uses pairwise-vote intrinsically).")
     args = parser.parse_args()
 
-    uses_empirical_arm_rewards = (args.acquisition in ("lp_chain", "lp_full") or (args.acquisition == "greedy" and args.reward_estimate == "unbiased"))
-    if (args.method == "submodular" and args.feedback == "bandit" and args.reward_update == "subsets" and uses_empirical_arm_rewards):
+    uses_empirical_arm_rewards = _uses_empirical_arm_rewards(args.acquisition, args.reward_estimate)
+    if (args.method == "adaptive" and args.feedback == "bandit" and args.reward_update == "subsets" and uses_empirical_arm_rewards):
         parser.error(
             "--feedback bandit is incompatible with --reward-update subsets "
             "when empirical arm rewards are used, because counterfactual "
             "replay requires y_true."
         )
-    if (args.reward_estimate == "unbiased" and args.acquisition not in ("greedy", "lp_chain")):
+    if (args.reward_estimate == "empirical" and args.acquisition not in ("greedy", "lp_chain")):
         parser.error(
-            "--reward-estimate unbiased applies only to "
-            "--acquisition greedy or lp_chain."
+            "--reward-estimate empirical applies only to "
+            "--acquisition greedy or lp_chain. lp_full and ucb_argmax "
+            "already score arms from the empirical accuracy table "
+            "unconditionally, so leave --reward-estimate at its default "
+            "('surrogate') there."
         )
 
     budget_fractions = tuple(float(x) for x in args.budget_fractions.split(","))
@@ -564,26 +608,20 @@ if __name__ == "__main__":
         results_dir = Path("results")
         results_dir.mkdir(parents=True, exist_ok=True)
         ti_tag = "_trainonly" if args.skip_inference else ""
-        fb_tag = f"_{args.feedback}" if args.method == "submodular" else ""
-        acq_tag = ""
-        uses_reward_update = (args.acquisition in ("lp_chain", "lp_full") or (args.acquisition == "greedy" and args.reward_estimate == "unbiased"))
-        if args.acquisition in ORACLE_ACQUISITION_MODES:
-            acq_tag = f"_{args.acquisition}"
-        elif uses_reward_update:
-            acq_tag = f"_{args.acquisition}-{args.reward_update}"
-        elif args.acquisition != "greedy":
-            acq_tag = f"_{args.acquisition}"
-        else:
-            acq_tag = ""
+        fb_tag = f"_{args.feedback}" if args.method == "adaptive" else ""
+        acq_tag = f"_{args.acquisition}"
+        if args.acquisition in ("greedy", "lp_chain", "lp_full", "ucb_argmax"):
+            acq_tag += f"-{args.reward_update}"
         alpha_tag = (f"_alpha{args.alpha_ucb:g}" if (args.alpha_ucb != 2.0 and args.acquisition not in ORACLE_ACQUISITION_MODES) else "")
-        re_tag = ("" if args.acquisition in ORACLE_ACQUISITION_MODES else f"_{args.reward_estimate}")
+        reward_estimate_is_live = (args.acquisition in ("greedy", "lp_chain"))
+        re_tag = (f"_{args.reward_estimate}" if reward_estimate_is_live else "")
         pr_tag = ("_pairwisevote" if (args.pred_rule == "pairwise_vote" and args.method in TWO_STAGE_FAMILY) else "")
         maxmod_label = "ALL" if max_modalities is None else str(max_modalities)
         classes_tag = ""
         if args.dataset in SYNTHETIC_DATASETS:
             n_classes = args.num_classes if args.dataset in MULTICLASS_SYNTHETIC_DATASETS else 2
             classes_tag = f"_classes{n_classes}"
-        output_xlsx = str(results_dir/ (f"results_{args.method}{fb_tag}{acq_tag}{re_tag}{alpha_tag}_{args.dataset}_max{maxmod_label}_seeds{len(seeds)}{ti_tag}{pr_tag}{classes_tag}.xlsx"))
+        output_xlsx = str(results_dir/ (f"results_{FILENAME_METHOD_LABELS.get(args.method, args.method)}{fb_tag}{acq_tag}{re_tag}{alpha_tag}_{args.dataset}_max{maxmod_label}_seeds{len(seeds)}{ti_tag}{pr_tag}{classes_tag}.xlsx"))
         
     save_unified_results_to_excel(rows, output_xlsx)
     print(f"Execution time: {time.time() - t0:.1f} seconds")
