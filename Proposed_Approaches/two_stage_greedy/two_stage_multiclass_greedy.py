@@ -28,6 +28,24 @@ ACQUISITION_MODES from core.submodular_greedy):
               a frozen distribution -- no UCB, no re-solve, no r_hat update.
               lp_full_opt minus lp_full is the price of LEARNING the arm
               values, holding action space and LP fixed.
+  "ucb_argmax"
+              The NOTEBOOK rule (multiclass_supervised_unbiased_adaptive.
+              ipynb's `sim_unbiased`), ported to this module and to
+              gmm_multiclass_submodular identically. Same full 2^(nviews-1)
+              arm table and same empirical r_hat as lp_full, but the
+              per-round policy is a DETERMINISTIC Lagrangian argmax,
+
+                  argmax_S  r_hat[S] - lambda_t * cost(S) + bonus[S],
+
+              with lambda_t the OMD dual "greedy" runs rather than an LP
+              shadow price. So ucb_argmax minus lp_full is the price of
+              committing to one arm instead of mixing over a distribution,
+              holding action space and reward table fixed -- the natural
+              companion to the lp_full_opt minus lp_full comparison above.
+              Capped at MAX_REWARD_ESTIMATE_VIEWS views like lp_full. Here
+              the r_hat it argmaxes over is seeded from Stage 1, so unlike
+              the submodular port it starts from real accuracies on round
+              one. NOT capped at 1.0 -- see below.
 
 === UCB CAPPING ===
 Every r_hat in this module is an EMPIRICAL 0/1 ACCURACY, so it lives in
@@ -43,6 +61,12 @@ capped at 1.0, which is the correct ceiling for a probability and keeps
 the ordering meaningful once counts diverge. The cap applies to the
 BIASED lp_chain/lp_full paths too -- their r_hat is the same empirical
 accuracy table, seeded by stage1_combo_rewards.
+
+The cap does NOT apply to "ucb_argmax". An argmax over capped values is an
+argmax over ties, and np.argmax breaks ties toward index 0 -- the free-only
+arm, cost 0, so lambda never rises and the policy is stuck there for the
+rest of the run. The LP modes survive capping because a tie still leaves
+them a feasible mixture to spend the budget on; the argmax does not.
 """
 
 from __future__ import annotations
@@ -55,18 +79,24 @@ from core.submodular_greedy import (
     # method and gmm_multiclass_submodular agree on what run_proposed_
     # methods.py's --acquisition / --reward-update values mean.
     ACQUISITION_MODES,           # noqa: F401 -- re-exported
+    ARGMAX_ACQUISITION_MODES,    # noqa: F401 -- re-exported
+    REWARD_ESTIMATES,            # noqa: F401 -- re-exported
+    validate_reward_estimate,
+    FULL_ENUMERATION_MODES,      # noqa: F401 -- re-exported
     LP_ACQUISITION_MODES,        # noqa: F401 -- re-exported
     MAX_REWARD_ESTIMATE_VIEWS,   # noqa: F401 -- re-exported
     ORACLE_ACQUISITION_MODES,    # noqa: F401 -- re-exported
     REWARD_UPDATE_SCOPES,        # noqa: F401 -- re-exported
     pairwise_diff_sq_from_means,
     arm_accuracies_from_means,
+    argmax_policy_over_estimates,
     greedy_chain,                # noqa: F401 -- re-exported (moved here)
     greedy_oracle,
     lp_policy_over_estimates,    # noqa: F401 -- re-exported (moved here)
     linprog_policy_over_estimates,
     build_arm_tables,
     mask_to_bits,
+    uses_empirical_arm_rewards as _uses_empirical_arm_rewards,   # noqa: F401
 )
 
 from core.multiclass_common import (
@@ -80,7 +110,11 @@ from core.multiclass_common import (
 
 LP_ACTION_SPACE = {"lp_chain": "chain", "lp_full": "full", "lp_full_opt": "full"}
 
-REWARD_ESTIMATES = ("biased", "unbiased")
+# REWARD_ESTIMATES is imported from core.submodular_greedy above and
+# re-exported here for the runner. Renamed from ("biased", "unbiased") to
+# ("surrogate", "empirical") to stop colliding with the containment-replay
+# sense of "unbiased" that acquisition="ucb_argmax" inherits from the
+# notebook. The old spellings are NOT accepted.
 
 # Mask-space prediction
 def predict_mask_multiclass(x_sample, centers, mask, return_score=False, pred_rule="nearest_center"):
@@ -124,7 +158,7 @@ def run_alg_greedy_multiclass(x, y, centers, costs, T1, training_budget, rng,
                               step_size=1.0, lambda_max=10.0,
                               pred_rule="nearest_center",
                               force_free=True, reward_update="subsets",
-                              true_means=None, reward_estimate="biased"):
+                              true_means=None, reward_estimate="surrogate"):
     """Greedy counterpart of two_stage_multiclass.run_alg_multiclass.
 
     Parameters
@@ -141,7 +175,8 @@ def run_alg_greedy_multiclass(x, y, centers, costs, T1, training_budget, rng,
         EXP4 version's (view_combinations, combo_costs) pair.
     T1, training_budget, rng, step_size, lambda_max, pred_rule
         Identical meaning to run_alg_multiclass.
-    acquisition : {"greedy", "lp_chain", "lp_full", "lp_full_opt"}
+    acquisition : {"greedy", "lp_chain", "lp_full", "lp_full_opt",
+                   "ucb_argmax"}
         The per-round acquisition policy -- see the module docstring.
         Default "greedy". Same vocabulary as
         gmm_multiclass_submodular.run_training_phase's flag of the same
@@ -149,15 +184,15 @@ def run_alg_greedy_multiclass(x, y, centers, costs, T1, training_budget, rng,
         ACQUISITION_MODES), which is what makes the two methods comparable
         on this axis.
     reward_update : {"subsets", "selected"}
-        Arm-scoring scope, lp_chain/lp_full ONLY; inert under "greedy",
-        which has no enumerated arms, and under "lp_full_opt", whose arm
-        values are exact and never scored.
-    reward_estimate : {"biased", "unbiased"}
+        Arm-scoring scope for lp_chain / lp_full / ucb_argmax; inert under
+        "greedy", which has no enumerated arms, and under "lp_full_opt",
+        whose arm values are exact and never scored.
+    reward_estimate : {"surrogate", "empirical"}
         How greedy_oracle / greedy_chain value a subset. Validated for
         MEMBERSHIP here, not only for compatibility with `acquisition`: a
         misspelling used to fall through the `reward_estimate ==
-        "unbiased"` test and silently run the BIASED path under an
-        unbiased label.
+        "empirical"` test and silently run the SURROGATE path under an
+        empirical label.
     true_means : (nclasses, nviews) array, REQUIRED for "lp_full_opt"
         The generative class means -- SYNTHETIC datasets only. Supply
         core.optimal_static.synthetic_true_means(...) at the POST-truncation
@@ -193,13 +228,11 @@ def run_alg_greedy_multiclass(x, y, centers, costs, T1, training_budget, rng,
                          f"got {reward_update!r}")
     # MEMBERSHIP check, deliberately separate from the acquisition-
     # compatibility check further down. Without it a typo ("unbaised")
-    # makes the `reward_estimate == "unbiased"` tests below evaluate False
+    # makes the `reward_estimate == "empirical"` tests below evaluate False
     # and the run proceeds on the BIASED path -- reported, and filenamed,
     # as whatever string was passed. Silent wrong-mode runs are worse than
     # a crash, so this rejects rather than falls back.
-    if reward_estimate not in REWARD_ESTIMATES:
-        raise ValueError(f"reward_estimate must be one of {REWARD_ESTIMATES}, "
-                         f"got {reward_estimate!r}")
+    validate_reward_estimate(reward_estimate)
     # One boolean, computed once, replacing the old
     # `center_update == "reward_estimates"` test at each of its five sites.
     use_lp = acquisition in LP_ACTION_SPACE
@@ -207,6 +240,12 @@ def run_alg_greedy_multiclass(x, y, centers, costs, T1, training_budget, rng,
     # neither estimates nor re-solves, so it splits off from `use_lp` at
     # exactly two sites -- the acquisition branch and the r_hat update.
     is_oracle = acquisition in ORACLE_ACQUISITION_MODES
+    # Third boolean: ucb_argmax enumerates and estimates like lp_full but
+    # plays a deterministic argmax and keeps the OMD dual, so it is NOT in
+    # use_lp -- which is exactly what leaves the dual update at step 5 live
+    # for it. It joins use_lp only at the arm-table setup and the r_hat
+    # update.
+    is_argmax = acquisition in ARGMAX_ACQUISITION_MODES
     if is_oracle and true_means is None:
         raise ValueError(
             f"acquisition={acquisition!r} needs the TRUE generative means, which "
@@ -237,23 +276,27 @@ def run_alg_greedy_multiclass(x, y, centers, costs, T1, training_budget, rng,
     training_remaining_budget = float(training_budget - T1)
     remaining_training_budget_per_sample = training_remaining_budget / T2
     # ── empirical/enumerated arm state ──
-    # Used by lp_chain/lp_full and by greedy when reward_estimate="unbiased".
+    # Used by lp_chain/lp_full/ucb_argmax and by greedy when
+    # reward_estimate="empirical".
     combos = bit_index = r_hat = combo_counts = None
     combo_masks = combo_cost = cost_order = None
 
-    unbiased = (reward_estimate == "unbiased" and acquisition in ("greedy", "lp_chain"))
-    if (reward_estimate == "unbiased" and acquisition not in ("greedy", "lp_chain")):
+    # Local flag renamed from `unbiased` to `empirical_est`: it meant
+    # reward_estimate, but sat beside ucb_argmax, whose notebook origin is
+    # also called "unbiased". `empirical_est` can only mean the one thing.
+    empirical_est = (reward_estimate == "empirical" and acquisition in ("greedy", "lp_chain"))
+    if (reward_estimate == "empirical" and acquisition not in ("greedy", "lp_chain")):
         raise ValueError(
-            f"reward_estimate='unbiased' applies to acquisition='greedy' "
+            f"reward_estimate='empirical' applies to acquisition='greedy' "
             f"or 'lp_chain'; got acquisition={acquisition!r}."
         )
 
-    if unbiased:
-        # Unbiased branch reward estimates intialization for each arm from Stage-1 empirical accuracy.
+    if empirical_est:
+        # Empirical-table branch: reward estimates intialization for each arm from Stage-1 empirical accuracy.
         # This will be used by both greedy and lp_chain acquisition modes.
         if nviews > MAX_REWARD_ESTIMATE_VIEWS:
             raise ValueError(
-                f"reward_estimate='unbiased' enumerates "
+                f"reward_estimate='empirical' enumerates "
                 f"2^(nviews-1) = 2^{nviews - 1} arms; "
                 f"nviews={nviews} exceeds "
                 f"MAX_REWARD_ESTIMATE_VIEWS={MAX_REWARD_ESTIMATE_VIEWS}."
@@ -267,6 +310,25 @@ def run_alg_greedy_multiclass(x, y, centers, costs, T1, training_budget, rng,
         arm_bits = tables["arm_bits"]
         bit_index = tables["bit_index"]
         # Stage 1 is fully observed, so initialize EVERY arm from genuine Stage-1 empirical accuracy
+        r_hat, combo_counts = stage1_combo_rewards(x, y, est_centers, T1, combos, nviews)
+    elif is_argmax:
+        # ucb_argmax: same FULL table and same Stage-1 seeding as lp_full.
+        # Only the per-round rule below differs, which is the point of the
+        # mode -- everything upstream of the policy is held fixed.
+        if nviews > MAX_REWARD_ESTIMATE_VIEWS:
+            raise ValueError(
+                f"acquisition='ucb_argmax' enumerates 2^(nviews-1) = "
+                f"2^{nviews - 1} arms; nviews={nviews} exceeds "
+                f"MAX_REWARD_ESTIMATE_VIEWS={MAX_REWARD_ESTIMATE_VIEWS}. "
+                f"Trim with max_modalities, or use acquisition='lp_chain' "
+                f"(nviews+1 arms).")
+        combos = generate_view_combinations(nviews)
+        tables = build_arm_tables(combos, costs, nviews)
+        combo_masks = tables["combo_masks"]
+        combo_cost = tables["combo_cost"]
+        cost_order = tables["cost_order"]
+        arm_bits = tables["arm_bits"]
+        bit_index = tables["bit_index"]
         r_hat, combo_counts = stage1_combo_rewards(x, y, est_centers, T1, combos, nviews)
     elif use_lp:
         # Biased branch reward estimates initialization for each arm from Stage-1 empirical accuracy.
@@ -330,7 +392,20 @@ def run_alg_greedy_multiclass(x, y, centers, costs, T1, training_budget, rng,
             # lp_full_opt: fixed oracle distribution solved before Stage 2.
             j = int(rng.choice(len(p_oracle), p=p_oracle))
             mask = combo_masks[j].copy()
-        elif acquisition == "lp_chain" and unbiased:
+        elif is_argmax:
+            # --------------------------------------------------------
+            # NOTEBOOK RULE (ucb_argmax)
+            #
+            # Deterministic Lagrangian argmax over the full table. No LP,
+            # no draw from rng: unlike every other Stage-2 mode this one
+            # consumes no randomness at all, so its trajectory is fixed
+            # once Stage 1 is. Bonus NOT capped at 1.0 -- module docstring.
+            # --------------------------------------------------------
+            ucb = r_hat + np.sqrt(alpha_ucb * np.log(round_idx + 2) / combo_counts)
+            j = argmax_policy_over_estimates(ucb, combo_cost, lambda_t,
+                                             training_remaining_budget)
+            mask = combo_masks[j].copy()
+        elif acquisition == "lp_chain" and empirical_est:
             # --------------------------------------------------------
             # UNBIASED LP-CHAIN
             #
@@ -357,7 +432,7 @@ def run_alg_greedy_multiclass(x, y, centers, costs, T1, training_budget, rng,
             # --------------------------------------------------------
             # BIASED LP-CHAIN / LP-FULL
             #
-            # For biased lp_chain the arm table is the fixed
+            # For surrogate lp_chain the arm table is the fixed
             # Bhattacharyya-derived chain constructed before Stage 2.
             # For lp_full it is the full enumeration.
             # --------------------------------------------------------
@@ -366,7 +441,7 @@ def run_alg_greedy_multiclass(x, y, centers, costs, T1, training_budget, rng,
             p_lp, lambda_t = linprog_policy_over_estimates(ucb, combo_cost, b_t,)
             j = int(rng.choice(len(p_lp), p=p_lp))
             mask = combo_masks[j].copy()
-        elif unbiased:
+        elif empirical_est:
             # --------------------------------------------------------
             # UNBIASED GREEDY
             #
@@ -423,7 +498,7 @@ def run_alg_greedy_multiclass(x, y, centers, costs, T1, training_budget, rng,
         # 4. EMPIRICAL ARM-REWARD UPDATE
         # ============================================================
 
-        if (use_lp or unbiased) and not is_oracle:
+        if (use_lp or empirical_est or is_argmax) and not is_oracle:
             played_bits = mask_to_bits(mask)
             if reward_update == "selected":
                 # Only the actually played subset receives an observation.
@@ -444,6 +519,9 @@ def run_alg_greedy_multiclass(x, y, centers, costs, T1, training_budget, rng,
         # ============================================================
         # 5. DUAL UPDATE
         # ============================================================
+        # Live for greedy AND ucb_argmax: neither has an LP to hand back a
+        # shadow price, and with lambda pinned at 0 the argmax would buy the
+        # full view set every round.
         if not use_lp:
             raw_lambda = (lambda_t + step_size * (cost - remaining_training_budget_per_sample))
             lambda_t = max(0.0, min(lambda_max, raw_lambda),)
