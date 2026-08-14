@@ -81,13 +81,18 @@ from gmm_submodular.gmm_multiclass_submodular import (
     run_training_phase,
     run_inference_phase,
 )
+# Single definition of "does --reward-update do anything for these flags",
+# replacing the three inline copies this file used to carry.
+from core.submodular_greedy import (
+    uses_empirical_arm_rewards as _uses_empirical_arm_rewards,
+)
 
 
 def run_experiment(
     dataset_name,
     feedback="full",
     acquisition="greedy",
-    reward_estimate="biased",
+    reward_estimate="surrogate",
     reward_update="subsets",
     max_modalities=None,
     seeds=(42, 43, 44, 45, 46),
@@ -127,7 +132,7 @@ def run_experiment(
         they do here by construction, since the same values feed
         load_dataset_as_numpy a few lines above.
     reward_update: "subsets" or "selected". Used by lp_chain/lp_full and by
-        greedy when reward_estimate="unbiased". Ignored by biased greedy
+        greedy when reward_estimate="empirical". Ignored by surrogate greedy
         and lp_full_opt.
     synthetic_n_classes: "synthetic" only. For every other
         dataset, nclasses is inferred from the labels.
@@ -164,7 +169,7 @@ def run_experiment(
 
     if reward_estimate not in REWARD_ESTIMATES:
         raise ValueError(f"reward_estimate must be one of {REWARD_ESTIMATES}, got {reward_estimate!r}")
-    uses_empirical_arm_rewards = (acquisition in ("lp_chain", "lp_full") or (acquisition == "greedy" and reward_estimate == "unbiased"))
+    uses_empirical_arm_rewards = _uses_empirical_arm_rewards(acquisition, reward_estimate)
 
     if (feedback == "bandit" and reward_update == "subsets"and uses_empirical_arm_rewards):
         raise ValueError(
@@ -209,7 +214,7 @@ def run_experiment(
         print(f"  [oracle] recovered true means for acquisition={acquisition}: "
               f"shape {true_means.shape}")
 
-    _has_ru = (acquisition in ("lp_chain", "lp_full") or (acquisition == "greedy" and reward_estimate == "unbiased"))
+    _has_ru = _uses_empirical_arm_rewards(acquisition, reward_estimate)
     ru_tag = f"/{reward_update}" if _has_ru else ""
     print(f"{dataset_name}: {n_samples} samples, {nviews} views, "
           f"{nclasses} classes, feedback={feedback}, "
@@ -282,7 +287,7 @@ def run_experiment(
             print(f"  [Training] Reward: {ph1['train_reward']:.3f} | F1: {ph1['train_f1']:.3f} "
                   f"| AUROC: {ph1['train_auroc']:.3f} | Spent: {ph1['spent']:.4f} / {training_budget:.4f} "
                   f"| Time: {train_time:.2f}s")
-            if acquisition != "greedy" or reward_estimate == "unbiased":
+            if acquisition != "greedy" or reward_estimate == "empirical":
                 print(
                     f"  [Training] Acquisition {acquisition}{ru_tag}, "
                     f"reward_estimate={reward_estimate}: "
@@ -357,7 +362,7 @@ def run_experiment(
 
 def save_results_to_excel(results, budget_fractions, dataset_name, feedback,
                           seeds=None, filename=None, acquisition="greedy",
-                          reward_estimate="biased",
+                          reward_estimate="surrogate",
                           reward_update=""):
     """Same shape as gmm_submodular_runner.save_results_to_excel, plus
     'Feedback' / 'Acquisition' / 'Reward Update' columns on every row
@@ -472,22 +477,37 @@ if __name__ == "__main__":
                               "keeps UCB reward estimates over the nviews+1 nested greedy "
                               "chain and solves the per-round budgeted LP over them exactly. "
                               "'lp_full' does the same over the FULL 2^(nviews-1) enumeration "
-                              "-- the small-nviews fidelity check for what the chain costs.")
-    parser.add_argument("--reward-estimate", choices=list(REWARD_ESTIMATES),
-                        default="biased",
-                        help="How greedy_oracle/greedy_chain value a subset. "
-                             "'biased': the Bhattacharyya surrogate computed "
-                             "from est_means (no data, no enumeration). "
-                             "'unbiased': a learned per-subset accuracy table "
-                             "maintained by the containment replay; needs "
-                             "2^(nviews-1) arms, so nviews must stay under "
-                             "MAX_REWARD_ESTIMATE_VIEWS.")
+                              "-- the small-nviews fidelity check for what the chain costs. "
+                              "'ucb_argmax' is the NOTEBOOK rule "
+                              "(multiclass_supervised_unbiased_adaptive.ipynb): lp_full's "
+                              "arm table and UCB estimates, but a DETERMINISTIC Lagrangian "
+                              "argmax (argmax_S r_hat - lambda*cost + bonus) with greedy's "
+                              "OMD dual in place of the LP, so it commits to one subset "
+                              "instead of sampling a mixture. Same 2^(nviews-1) cap as "
+                              "lp_full; --reward-estimate is inert under it (the empirical "
+                              "table is unconditional).")
+    parser.add_argument("--reward-estimate",
+                        choices=list(REWARD_ESTIMATES),
+                        default="surrogate",
+                        help="What the per-arm reward estimates ARE. "
+                             "'surrogate': the closed-form Bhattacharyya "
+                             "proxy computed from the estimated means -- "
+                             "needs no observations and no enumeration. "
+                             "'empirical': a measured per-subset accuracy "
+                             "table filled in by the containment replay; "
+                             "needs 2^(nviews-1) arms, so nviews must stay "
+                             "under MAX_REWARD_ESTIMATE_VIEWS. RENAMED from "
+                             "biased/unbiased, which are NO LONGER ACCEPTED, "
+                             "because 'unbiased' also names the "
+                             "containment-replay acquisition (--acquisition "
+                             "ucb_argmax, from sim_unbiased) and the two are "
+                             "unrelated.")
     parser.add_argument("--reward-update", choices=REWARD_UPDATE_SCOPES, default="subsets",
                          help="How empirical arm rewards are updated. "
                                 "'subsets' replays every arm contained in the played subset "
                                 "(counterfactual; requires y_true); 'selected' updates only the "
                                 "played arm from its 0/1 reward. Used by lp_chain/lp_full and by "
-                                "greedy when --reward-estimate unbiased. Ignored by biased greedy "
+                                "greedy when --reward-estimate empirical. Ignored by surrogate greedy "
                                 "and lp_full_opt."
                         )
     parser.add_argument("--data-path", type=str, default=None)
@@ -558,7 +578,7 @@ if __name__ == "__main__":
         image_data_home=args.image_cache_dir,
     )
 
-    _cli_has_ru = (args.acquisition in ("lp_chain", "lp_full") or (args.acquisition == "greedy" and args.reward_estimate == "unbiased"))
+    _cli_has_ru = _uses_empirical_arm_rewards(args.acquisition, args.reward_estimate)
     acq_label = args.acquisition + (f"/{args.reward_update}" if _cli_has_ru else "")
     print(f"\n{'=' * 70}\nSUMMARY (mean +/- std across seeds) -- {args.dataset} / "
           f"{args.feedback} / {acq_label}\n{'=' * 70}")
@@ -590,22 +610,25 @@ if __name__ == "__main__":
         classes_tag = f"_classes{n_classes}"
 
     # Same scheme as run_proposed_methods.py, so the two entry points write
-    # matching names. NOTE the previous version collapsed greedy+unbiased to
+    # matching names. NOTE the previous version collapsed greedy+empirical to
     # "" and so gave --reward-update subsets and selected the SAME filename,
     # silently overwriting one run with the other.
-    if args.acquisition in ORACLE_ACQUISITION_MODES:
-        acq_tag = f"_{args.acquisition}"
-    elif _cli_has_ru:
-        acq_tag = f"_{args.acquisition}-{args.reward_update}"
-    elif args.acquisition != "greedy":
-        acq_tag = f"_{args.acquisition}"
-    else:
-        acq_tag = ""
+    #
+    # The acquisition is now ALWAYS named, including the "greedy" default,
+    # which surrogate greedy alone used to omit -- so
+    # "results_gmm_full_surrogate_..." was a greedy run whose name did not say
+    # so, and did not sort beside its own lp_chain/lp_full siblings.
+    # CHANGES default filenames for surrogate greedy runs only.
+    acq_tag = f"_{args.acquisition}"
+    if _cli_has_ru:
+        acq_tag += f"-{args.reward_update}"
 
-    re_tag = f"_{args.reward_estimate}"
+    reward_estimate_is_live = (args.acquisition in ("greedy", "lp_chain"))
+    re_tag = (f"_{args.reward_estimate}" if reward_estimate_is_live else "")
     output_xlsx = args.output_xlsx or (
-        f"results_gmm_{args.feedback}{acq_tag}{re_tag}_{args.dataset}_"
-        f"max{maxmod_label}_seeds{len(seeds)}{ti_tag}{classes_tag}.xlsx"
+        f"results_adaptive_{args.feedback}{acq_tag}{re_tag}_"
+        f"{args.dataset}_max{maxmod_label}_seeds{len(seeds)}"
+        f"{ti_tag}{classes_tag}.xlsx"
     )
     save_results_to_excel(results, budget_fractions, args.dataset, args.feedback,
                           seeds=seeds, filename=output_xlsx,
