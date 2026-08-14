@@ -15,11 +15,86 @@ import numba
 import numpy as np
 import scipy.optimize as opt
 
-ACQUISITION_MODES = ("greedy", "lp_chain", "lp_full", "lp_full_opt")
+ACQUISITION_MODES = ("greedy", "lp_chain", "lp_full", "lp_full_opt", "ucb_argmax")
 LP_ACQUISITION_MODES = ("lp_chain", "lp_full", "lp_full_opt")
 ORACLE_ACQUISITION_MODES = ("lp_full_opt",)
+# "ucb_argmax": the NOTEBOOK rule (multiclass_supervised_unbiased_adaptive).
+# Full 2^(nviews-1) arm table like lp_full, empirical accuracy estimates like
+# lp_full, but the per-round policy is a DETERMINISTIC Lagrangian argmax
+# rather than an LP over a distribution:
+#     argmax_S  r_hat[S] - lambda_t * cost(S) + bonus[S]
+# and lambda_t is the OMD dual, as under "greedy". So it sits exactly between
+# the two existing families: lp_full's action space and reward table with
+# greedy's dual and greedy's single-arm (no randomisation) commitment.
+ARGMAX_ACQUISITION_MODES = ("ucb_argmax",)
+# Modes that enumerate the FULL powerset eagerly and are therefore capped at
+# MAX_REWARD_ESTIMATE_VIEWS. (lp_chain enumerates only nviews+1 arms unless
+# reward_estimate="empirical", which is capped separately at its own site.)
+FULL_ENUMERATION_MODES = ("lp_full", "lp_full_opt", "ucb_argmax")
 REWARD_UPDATE_SCOPES = ("subsets", "selected")
 MAX_REWARD_ESTIMATE_VIEWS = 20
+
+# === reward_estimate: WHAT the arm values are, not whether they are unbiased
+#
+# RENAMED. These were "biased" / "unbiased", which collided head-on with the
+# OTHER "unbiased" in this codebase -- the containment-replay acquisition
+# ported from multiclass_supervised_unbiased_adaptive.ipynb, whose
+# `sim_unbiased` is about REPLAY SCOPE (score every contained subset from
+# one observed row), not about estimator bias. Two unrelated meanings on
+# one word, one of which was never accurate anyway: the old "unbiased"
+# table is a uniform running mean over rounds whose classifier keeps
+# improving, so it lags and is biased low (see the CAVEAT in both method
+# modules). The names now say what the values ARE:
+#
+#   "surrogate" (was "biased")    the closed-form Bhattacharyya proxy,
+#                                 computed from estimated means, needs no
+#                                 observations and no enumeration.
+#   "empirical" (was "unbiased")  a measured per-subset accuracy table,
+#                                 filled in from actual predictions, needs
+#                                 2^(nviews-1) arms.
+REWARD_ESTIMATES = ("surrogate", "empirical")
+
+
+def validate_reward_estimate(reward_estimate):
+    """Membership check for reward_estimate. Returns it unchanged.
+
+    A function rather than an inline `not in` test only so the message is
+    written once for the three call sites (both method modules and the
+    unified runner).
+    """
+    if reward_estimate not in REWARD_ESTIMATES:
+        raise ValueError(
+            f"reward_estimate must be one of {REWARD_ESTIMATES}; got "
+            f"{reward_estimate!r}. NOTE these were renamed from "
+            f"'biased'/'unbiased' -- 'biased' is now 'surrogate' and "
+            f"'unbiased' is now 'empirical'. The old names are NOT "
+            f"accepted; update the call site or script.")
+    return reward_estimate
+
+
+def uses_empirical_arm_rewards(acquisition, reward_estimate="surrogate"):
+    """Does this (acquisition, reward_estimate) pair maintain the learned
+    per-arm accuracy table -- i.e. is --reward-update live for it?
+
+    Single definition of a predicate that used to be spelled out inline,
+    identically, at eight call sites across both method families, the two
+    runners and run_proposed_methods. Adding "ucb_argmax" in one place is
+    the whole reason this exists; the previous copies would each have had to
+    grow the same third string.
+
+    False for surrogate greedy (the Bhattacharyya proxy needs no data) and
+    for lp_full_opt (its arm values are exact and never scored).
+
+    NOTE the two "empirical"s here are different things and both are
+    correct: the FUNCTION name is about the acquisition consuming a measured
+    table at all, which lp_chain / lp_full / ucb_argmax do regardless of
+    reward_estimate; the ARGUMENT value is about greedy specifically, which
+    is the one mode that can be pointed at either the surrogate or the
+    measured table.
+    """
+    return (acquisition in ("lp_chain", "lp_full", "ucb_argmax")
+            or (acquisition == "greedy"
+                and reward_estimate == "empirical"))
 
 # Reward
 @numba.njit
@@ -302,6 +377,59 @@ def linprog_policy_over_estimates(ucb, combo_cost, budget_per_round):
         lam = -float(marg.marginals[0])
 
     return p, max(lam, 0.0)
+
+def argmax_policy_over_estimates(ucb, combo_cost, omd_lambda,
+                                 remain_budget=None):
+    """The NOTEBOOK's acquisition rule (acquisition="ucb_argmax"): pick the
+    single arm maximising the Lagrangian
+
+        score_c = ucb_c - omd_lambda * cost_c
+
+    over the ENUMERATED arms, with no randomisation and no LP.
+
+    Differences from lp_policy/linprog_policy_over_estimates, which share
+    this call site's inputs:
+
+      * DETERMINISTIC. The LP returns a distribution and the caller draws
+        from it, so the LP can hit a per-round budget exactly by mixing two
+        arms. This returns one index; the budget is respected only in
+        expectation, through omd_lambda, exactly as acquisition="greedy"
+        does. The caller must therefore keep running its OMD dual update --
+        with omd_lambda pinned at 0 this degenerates to "always buy the
+        highest-ucb arm", which is usually the full view set.
+      * COST ENTERS LINEARLY, not as a constraint. An arm whose cost exceeds
+        what is left is still scored; `remain_budget` (optional) filters it
+        out afterwards.
+
+    Parameters
+    ----------
+    ucb : (n_arms,) array
+        Arm values, already including any exploration bonus. NOT capped at
+        1.0 here, deliberately -- see the CAPPING note in the two callers'
+        module docstrings: capping an argmax collapses saturated arms into a
+        tie that np.argmax always breaks toward index 0.
+    combo_cost : (n_arms,) array, total cost of each arm.
+    omd_lambda : float, current dual variable / shadow price.
+    remain_budget : float or None
+        If given, arms costing more than this are excluded. When nothing is
+        affordable the cheapest arm is returned rather than raising -- with
+        this codebase's cost convention (arm 0 is the free view alone, cost
+        0) that is the free-only fallback every other mode also uses.
+
+    Returns
+    -------
+    int : index into `ucb` / `combo_cost`.
+    """
+    ucb = np.asarray(ucb, dtype=np.float64).ravel()
+    combo_cost = np.asarray(combo_cost, dtype=np.float64).ravel()
+    score = ucb - float(omd_lambda) * combo_cost
+    if remain_budget is not None:
+        affordable = combo_cost <= float(remain_budget) + 1e-12
+        if not affordable.any():
+            return int(np.argmin(combo_cost))
+        score = np.where(affordable, score, -np.inf)
+    return int(np.argmax(score))
+
 
 def build_arm_tables(combos, costs, nviews):
     """Bookkeeping shared by every enumerated-action-space caller.
