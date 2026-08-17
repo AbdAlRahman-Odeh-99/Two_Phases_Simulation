@@ -46,27 +46,6 @@ ACQUISITION_MODES from core.submodular_greedy):
               the r_hat it argmaxes over is seeded from Stage 1, so unlike
               the submodular port it starts from real accuracies on round
               one. NOT capped at 1.0 -- see below.
-
-=== UCB CAPPING ===
-Every r_hat in this module is an EMPIRICAL 0/1 ACCURACY, so it lives in
-[0, 1] and so does its optimistic counterpart. The exploration bonus
-sqrt(alpha_ucb * log(round + 2) / count) does NOT respect that range: at
-count = T1 = 0 (init_fraction 0, where stage1_combo_rewards can only
-return a flat 1/nclasses with count 1) the bonus passes 1.0 within a few
-dozen rounds and exceeds the entire range of the quantity it decorates.
-Arm ORDERING is then driven by which arms the containment replay has
-happened to touch, not by learned accuracy, and the policy degenerates
-into "buy the largest affordable subset". Every UCB below is therefore
-capped at 1.0, which is the correct ceiling for a probability and keeps
-the ordering meaningful once counts diverge. The cap applies to the
-BIASED lp_chain/lp_full paths too -- their r_hat is the same empirical
-accuracy table, seeded by stage1_combo_rewards.
-
-The cap does NOT apply to "ucb_argmax". An argmax over capped values is an
-argmax over ties, and np.argmax breaks ties toward index 0 -- the free-only
-arm, cost 0, so lambda never rises and the policy is stuck there for the
-rest of the run. The LP modes survive capping because a tie still leaves
-them a feasible mixture to spend the budget on; the argmax does not.
 """
 
 from __future__ import annotations
@@ -80,6 +59,7 @@ from core.submodular_greedy import (
     # methods.py's --acquisition / --reward-update values mean.
     ACQUISITION_MODES,           # noqa: F401 -- re-exported
     ARGMAX_ACQUISITION_MODES,    # noqa: F401 -- re-exported
+    HEDGE_ACQUISITION_MODES,     # noqa: F401 -- re-exported
     REWARD_ESTIMATES,            # noqa: F401 -- re-exported
     validate_reward_estimate,
     FULL_ENUMERATION_MODES,      # noqa: F401 -- re-exported
@@ -110,11 +90,6 @@ from core.multiclass_common import (
 
 LP_ACTION_SPACE = {"lp_chain": "chain", "lp_full": "full", "lp_full_opt": "full"}
 
-# REWARD_ESTIMATES is imported from core.submodular_greedy above and
-# re-exported here for the runner. Renamed from ("biased", "unbiased") to
-# ("surrogate", "empirical") to stop colliding with the containment-replay
-# sense of "unbiased" that acquisition="ucb_argmax" inherits from the
-# notebook. The old spellings are NOT accepted.
 
 # Mask-space prediction
 def predict_mask_multiclass(x_sample, centers, mask, return_score=False, pred_rule="nearest_center"):
@@ -134,23 +109,24 @@ def stage1_counts(y, T1, nclasses, nviews):
     per_class = 1 + np.bincount(np.asarray(y[:T1], dtype=int), minlength=nclasses)
     return np.repeat(per_class[:nclasses, None], nviews, axis=1).astype(np.float64)
 
-def stage1_combo_rewards(x, y, centers, T1, combos, nviews):
+def stage1_combo_rewards(x, y, centers, T1, combos, nviews, pred_rule="nearest_center",):
     """
-    Stage 1 observes ALL views for its T1 rows, so the frozen classifier can
-    be REPLAYED over those rows using only the views in a combination. The
-    result is that combination's EMPIRICAL ACCURACY.
+    Replay the frozen Stage-1 classifier over every combination using the
+    same prediction rule used during Stage 2.
     """
     if T1 <= 0:
-        return (np.full(len(combos), 1.0 / centers.shape[0]), np.ones(len(combos), dtype=np.float64))
-    xs, ys = x[:T1], np.asarray(y[:T1], dtype=int)
+        return (np.full(len(combos), 1.0 / centers.shape[0], dtype=np.float64,), np.ones(len(combos), dtype=np.float64),)
+
+    xs = np.asarray(x[:T1], dtype=np.float64)
+    ys = np.asarray(y[:T1], dtype=int)
     r_hat = np.empty(len(combos), dtype=np.float64)
     for j, combo in enumerate(combos):
-        m = np.zeros(nviews, dtype=bool)
-        m[np.array(combo) - 1] = True
-        d = ((xs[:, None, m] - centers[None, :, m]) ** 2).sum(axis=2)  # (T1, nc)
-        r_hat[j] = float(np.mean(d.argmin(axis=1) == ys))
-    return r_hat, np.full(len(combos), float(T1))
-
+        mask = np.zeros(nviews, dtype=bool)
+        mask[np.asarray(combo, dtype=int) - 1] = True
+        predictions = np.array([predict_mask_multiclass(x_sample, centers, mask, pred_rule=pred_rule,) for x_sample in xs], dtype=int,)
+        r_hat[j] = float(np.mean(predictions == ys))
+    combo_counts = np.full(len(combos), float(T1), dtype=np.float64,)
+    return r_hat, combo_counts
 
 # Stage 2 (training phase)
 def run_alg_greedy_multiclass(x, y, centers, costs, T1, training_budget, rng,
@@ -176,7 +152,7 @@ def run_alg_greedy_multiclass(x, y, centers, costs, T1, training_budget, rng,
     T1, training_budget, rng, step_size, lambda_max, pred_rule
         Identical meaning to run_alg_multiclass.
     acquisition : {"greedy", "lp_chain", "lp_full", "lp_full_opt",
-                   "ucb_argmax"}
+                   "ucb_argmax", "hedge"}
         The per-round acquisition policy -- see the module docstring.
         Default "greedy". Same vocabulary as
         gmm_multiclass_submodular.run_training_phase's flag of the same
@@ -184,7 +160,7 @@ def run_alg_greedy_multiclass(x, y, centers, costs, T1, training_budget, rng,
         ACQUISITION_MODES), which is what makes the two methods comparable
         on this axis.
     reward_update : {"subsets", "selected"}
-        Arm-scoring scope for lp_chain / lp_full / ucb_argmax; inert under
+        Arm-scoring scope for lp_chain / lp_full / ucb_argmax / hedge; inert under
         "greedy", which has no enumerated arms, and under "lp_full_opt",
         whose arm values are exact and never scored.
     reward_estimate : {"surrogate", "empirical"}
@@ -226,26 +202,14 @@ def run_alg_greedy_multiclass(x, y, centers, costs, T1, training_budget, rng,
     if reward_update not in REWARD_UPDATE_SCOPES:
         raise ValueError(f"reward_update must be one of {REWARD_UPDATE_SCOPES}, "
                          f"got {reward_update!r}")
-    # MEMBERSHIP check, deliberately separate from the acquisition-
-    # compatibility check further down. Without it a typo ("unbaised")
-    # makes the `reward_estimate == "empirical"` tests below evaluate False
-    # and the run proceeds on the BIASED path -- reported, and filenamed,
-    # as whatever string was passed. Silent wrong-mode runs are worse than
-    # a crash, so this rejects rather than falls back.
+    
     validate_reward_estimate(reward_estimate)
-    # One boolean, computed once, replacing the old
-    # `center_update == "reward_estimates"` test at each of its five sites.
     use_lp = acquisition in LP_ACTION_SPACE
-    # Second boolean: an oracle mode enumerates and plays like an LP mode but
-    # neither estimates nor re-solves, so it splits off from `use_lp` at
-    # exactly two sites -- the acquisition branch and the r_hat update.
     is_oracle = acquisition in ORACLE_ACQUISITION_MODES
-    # Third boolean: ucb_argmax enumerates and estimates like lp_full but
-    # plays a deterministic argmax and keeps the OMD dual, so it is NOT in
-    # use_lp -- which is exactly what leaves the dual update at step 5 live
-    # for it. It joins use_lp only at the arm-table setup and the r_hat
-    # update.
     is_argmax = acquisition in ARGMAX_ACQUISITION_MODES
+    is_hedge = acquisition in HEDGE_ACQUISITION_MODES
+    uses_full_empirical_table = is_argmax or is_hedge
+
     if is_oracle and true_means is None:
         raise ValueError(
             f"acquisition={acquisition!r} needs the TRUE generative means, which "
@@ -272,18 +236,18 @@ def run_alg_greedy_multiclass(x, y, centers, costs, T1, training_budget, rng,
     if not free_only_mask.any():  # no free view in this cost model
         free_only_mask[int(np.argmin(costs))] = True
 
-    training_budget_spent = float(T1)
-    training_remaining_budget = float(training_budget - T1)
+    stage1_cost_per_sample = float(np.sum(costs))
+    stage1_budget_spent = float(T1) * stage1_cost_per_sample
+    training_budget_spent = stage1_budget_spent
+    training_remaining_budget = float(training_budget - stage1_budget_spent)
     remaining_training_budget_per_sample = training_remaining_budget / T2
+
     # ── empirical/enumerated arm state ──
-    # Used by lp_chain/lp_full/ucb_argmax and by greedy when
+    # Used by lp_chain/lp_full/ucb_argmax/hedge and by greedy when
     # reward_estimate="empirical".
     combos = bit_index = r_hat = combo_counts = None
     combo_masks = combo_cost = cost_order = None
 
-    # Local flag renamed from `unbiased` to `empirical_est`: it meant
-    # reward_estimate, but sat beside ucb_argmax, whose notebook origin is
-    # also called "unbiased". `empirical_est` can only mean the one thing.
     empirical_est = (reward_estimate == "empirical" and acquisition in ("greedy", "lp_chain"))
     if (reward_estimate == "empirical" and acquisition not in ("greedy", "lp_chain")):
         raise ValueError(
@@ -310,14 +274,11 @@ def run_alg_greedy_multiclass(x, y, centers, costs, T1, training_budget, rng,
         arm_bits = tables["arm_bits"]
         bit_index = tables["bit_index"]
         # Stage 1 is fully observed, so initialize EVERY arm from genuine Stage-1 empirical accuracy
-        r_hat, combo_counts = stage1_combo_rewards(x, y, est_centers, T1, combos, nviews)
-    elif is_argmax:
-        # ucb_argmax: same FULL table and same Stage-1 seeding as lp_full.
-        # Only the per-round rule below differs, which is the point of the
-        # mode -- everything upstream of the policy is held fixed.
+        r_hat, combo_counts = stage1_combo_rewards(x, y, est_centers, T1, combos, nviews, pred_rule=pred_rule)
+    elif uses_full_empirical_table:
         if nviews > MAX_REWARD_ESTIMATE_VIEWS:
             raise ValueError(
-                f"acquisition='ucb_argmax' enumerates 2^(nviews-1) = "
+                f"acquisition='ucb_argmax' and 'hedge' enumerates 2^(nviews-1) = "
                 f"2^{nviews - 1} arms; nviews={nviews} exceeds "
                 f"MAX_REWARD_ESTIMATE_VIEWS={MAX_REWARD_ESTIMATE_VIEWS}. "
                 f"Trim with max_modalities, or use acquisition='lp_chain' "
@@ -329,7 +290,7 @@ def run_alg_greedy_multiclass(x, y, centers, costs, T1, training_budget, rng,
         cost_order = tables["cost_order"]
         arm_bits = tables["arm_bits"]
         bit_index = tables["bit_index"]
-        r_hat, combo_counts = stage1_combo_rewards(x, y, est_centers, T1, combos, nviews)
+        r_hat, combo_counts = stage1_combo_rewards(x, y, est_centers, T1, combos, nviews, pred_rule=pred_rule)
     elif use_lp:
         # Biased branch reward estimates initialization for each arm from Stage-1 empirical accuracy.
         # This will be used by both lp_chain and lp_full acquisition modes.
@@ -349,7 +310,7 @@ def run_alg_greedy_multiclass(x, y, centers, costs, T1, training_budget, rng,
             r_hat = arm_accuracies_from_means(x[T1:], y[T1:], true_means, combo_masks)
             combo_counts = np.full(len(combos), float(T2))
         else:
-            r_hat, combo_counts = stage1_combo_rewards(x, y, est_centers, T1, combos, nviews)
+            r_hat, combo_counts = stage1_combo_rewards(x, y, est_centers, T1, combos, nviews, pred_rule=pred_rule)
 
     lambda_t = 0.0
 
@@ -366,19 +327,13 @@ def run_alg_greedy_multiclass(x, y, centers, costs, T1, training_budget, rng,
     selected_subsets = [tuple(range(1, nviews + 1)) for _ in range(T1)]
     errors = 0
 
-    # ── ORACLE LP, solved ONCE before the loop ("lp_full_opt" only) ──
-    # Exact arm values and a flat allowance mean nothing about this LP
-    # changes between rounds, so it is solved here and every Stage-2 round
-    # reduces to one draw from p_oracle. The allowance is the FLAT
-    # (training_budget - T1) / T2 and stays flat: "solve once" and "re-solve
-    # against what is left" cannot both hold, and this mode is the former by
-    # construction. That makes it the ceiling for NON-ADAPTIVE policies --
-    # it never looks at x_t or at surviving budget -- so the adaptive modes
-    # below may legitimately beat it. Same caveat core.optimal_static states.
     p_oracle = None
     if is_oracle:
         p_oracle, lambda_t = linprog_policy_over_estimates(
             r_hat, combo_cost, max(0.0, remaining_training_budget_per_sample))
+    if is_hedge:
+        hedge_v = np.ones(2, dtype=np.float64)
+        hedge_epsilon = np.sqrt(np.log(2.0) / T2)
 
     for t in range(T1, total_samples):
         round_idx = t - T1
@@ -393,27 +348,23 @@ def run_alg_greedy_multiclass(x, y, centers, costs, T1, training_budget, rng,
             j = int(rng.choice(len(p_oracle), p=p_oracle))
             mask = combo_masks[j].copy()
         elif is_argmax:
-            # --------------------------------------------------------
-            # NOTEBOOK RULE (ucb_argmax)
-            #
-            # Deterministic Lagrangian argmax over the full table. No LP,
-            # no draw from rng: unlike every other Stage-2 mode this one
-            # consumes no randomness at all, so its trajectory is fixed
-            # once Stage 1 is. Bonus NOT capped at 1.0 -- module docstring.
-            # --------------------------------------------------------
             ucb = r_hat + np.sqrt(alpha_ucb * np.log(round_idx + 2) / combo_counts)
-            j = argmax_policy_over_estimates(ucb, combo_cost, lambda_t,
-                                             training_remaining_budget)
+            j = argmax_policy_over_estimates(ucb, combo_cost, lambda_t, training_remaining_budget)
             mask = combo_masks[j].copy()
+        elif is_hedge:
+            ucb = (r_hat + np.sqrt(alpha_ucb * np.log(round_idx + 2) / combo_counts))
+            hedge_y = hedge_v / hedge_v.sum()
+            effective_cost = (hedge_y[0] + hedge_y[1] * combo_cost)
+            score = ucb / effective_cost
+            affordable = (combo_cost <= training_remaining_budget + 1e-12)
+            score = np.where(affordable, score, -np.inf,)
+            if np.all(~np.isfinite(score)):
+                mask = free_only_mask.copy()
+            else:
+                j = int(np.argmax(score))
+                mask = combo_masks[j].copy()
         elif acquisition == "lp_chain" and empirical_est:
-            # --------------------------------------------------------
-            # UNBIASED LP-CHAIN
-            #
-            # r_hat/combo_counts live on the FULL powerset table.
-            # Build the current greedy chain using those empirical UCB
-            # values, then solve the LP only over the chain.
-            # --------------------------------------------------------
-            # capped at 1.0 -- r_hat is an accuracy (module docstring).
+            # EMPIRICAL LP-CHAIN
             ucb_full = r_hat + np.sqrt(alpha_ucb * np.log(round_idx + 2) / combo_counts)
             def gain_func(sel, _u=ucb_full):
                 bits = sum(1 << int(i) for i in sel)
@@ -429,38 +380,21 @@ def run_alg_greedy_multiclass(x, y, centers, costs, T1, training_budget, rng,
             j = int(rng.choice(len(p_lp), p=p_lp))
             mask = act_masks[j].copy()
         elif use_lp:
-            # --------------------------------------------------------
-            # BIASED LP-CHAIN / LP-FULL
-            #
-            # For surrogate lp_chain the arm table is the fixed
-            # Bhattacharyya-derived chain constructed before Stage 2.
-            # For lp_full it is the full enumeration.
-            # --------------------------------------------------------
+            # SURROGATE LP-CHAIN / LP-FULL
             ucb = r_hat + np.sqrt(alpha_ucb * np.log(round_idx + 2) / combo_counts)
             b_t = (max(0.0, training_remaining_budget) / max(1, total_samples - t))
             p_lp, lambda_t = linprog_policy_over_estimates(ucb, combo_cost, b_t,)
             j = int(rng.choice(len(p_lp), p=p_lp))
             mask = combo_masks[j].copy()
         elif empirical_est:
-            # --------------------------------------------------------
-            # UNBIASED GREEDY
-            #
-            # Search with empirical subset UCB rather than the
-            # Bhattacharyya surrogate.
-            # --------------------------------------------------------
-            # capped at 1.0 -- r_hat is an accuracy (module docstring).
+            # EMPIRICAL GREEDY
             ucb = r_hat + np.sqrt(alpha_ucb * np.log(round_idx + 2) / combo_counts)
             def gain_func(sel, _ucb=ucb):
                 bits = sum(1 << int(i) for i in sel)
                 return float(_ucb[bit_index[bits]])
             mask = greedy_oracle(None, costs, lambda_t, training_remaining_budget, free_indices, force_free=force_free, gain_func=gain_func, empty_value=1.0 / nclasses,)
         else:
-            # --------------------------------------------------------
-            # BIASED GREEDY
-            #
-            # NOTE: this bonus decorates diff_mean_sq (a squared distance),
-            # NOT a probability, so it is deliberately NOT capped at 1.0.
-            # --------------------------------------------------------
+            # SURROGATE GREEDY
             diff_mean_sq = pairwise_diff_sq_from_means(est_centers)
             if alpha_ucb > 0:
                 inv_sqrt_cnt = np.sqrt(1.0 / est_counts).T
@@ -476,6 +410,9 @@ def run_alg_greedy_multiclass(x, y, centers, costs, T1, training_budget, rng,
         if training_remaining_budget < cost:
             mask = free_only_mask.copy()
             cost = float(np.sum(costs[mask]))
+        if is_hedge:
+            resource_z = np.array([1.0, cost], dtype=np.float64,)
+            hedge_v *= ((1.0 + hedge_epsilon) ** resource_z)
         # ============================================================
         # 3. PREDICTION / REWARD
         # ============================================================
@@ -498,7 +435,7 @@ def run_alg_greedy_multiclass(x, y, centers, costs, T1, training_budget, rng,
         # 4. EMPIRICAL ARM-REWARD UPDATE
         # ============================================================
 
-        if (use_lp or empirical_est or is_argmax) and not is_oracle:
+        if (use_lp or empirical_est or is_argmax or is_hedge) and not is_oracle:
             played_bits = mask_to_bits(mask)
             if reward_update == "selected":
                 # Only the actually played subset receives an observation.
@@ -519,10 +456,7 @@ def run_alg_greedy_multiclass(x, y, centers, costs, T1, training_budget, rng,
         # ============================================================
         # 5. DUAL UPDATE
         # ============================================================
-        # Live for greedy AND ucb_argmax: neither has an LP to hand back a
-        # shadow price, and with lambda pinned at 0 the argmax would buy the
-        # full view set every round.
-        if not use_lp:
+        if acquisition in ("greedy",) + ARGMAX_ACQUISITION_MODES:
             raw_lambda = (lambda_t + step_size * (cost - remaining_training_budget_per_sample))
             lambda_t = max(0.0, min(lambda_max, raw_lambda),)
         # ============================================================
@@ -548,7 +482,7 @@ def run_alg_greedy_multiclass(x, y, centers, costs, T1, training_budget, rng,
         'train_f1': train_f1,
         'train_auroc': train_auroc,
         'training_budget_spent': training_budget_spent,
-        'training_budget_spent_stage2': training_budget_spent - T1,
+        'training_budget_spent_stage2': training_budget_spent - stage1_budget_spent,
         'training_remaining_budget': training_remaining_budget,
         'lambda_final': lambda_t,
         'warm_start': False,

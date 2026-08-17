@@ -523,6 +523,7 @@ if __name__ == "__main__":
     # gmm_multiclass_submodular_runner.py. This CHANGES default filenames.
     reward_estimate_is_live = (args.acquisition in ("greedy", "lp_chain"))
     re_tag = (f"_{args.reward_estimate}" if reward_estimate_is_live else "")
+    dual_tag = f"_step{args.step_size:g}_lmax{args.lambda_max:g}"
     classes_tag = ""
     if args.dataset in SYNTHETIC_DATASETS:
         n_classes = args.num_classes if args.dataset in MULTICLASS_SYNTHETIC_DATASETS else 2
@@ -531,7 +532,7 @@ if __name__ == "__main__":
         all_results,
         args.dataset,
         filename=args.output_xlsx or (
-            f"results_two_stage{cu_tag}{re_tag}_"
+            f"results_two_stage{cu_tag}{re_tag}{dual_tag}_"
             f"{args.dataset}_max{maxmod_label}_seeds{len(seeds)}"
             f"{ti_tag}{pr_tag}{au_tag}{classes_tag}.xlsx"
         ),
