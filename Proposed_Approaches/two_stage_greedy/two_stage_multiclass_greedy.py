@@ -46,12 +46,30 @@ ACQUISITION_MODES from core.submodular_greedy):
               the r_hat it argmaxes over is seeded from Stage 1, so unlike
               the submodular port it starts from real accuracies on round
               one. NOT capped at 1.0 -- see below.
+
+=== Instrumentation ===
+The Stage-2 loop's numbered sections are timed individually into
+t_reward_update, t_dual_update and t_predict (t_acquisition is measured
+one level down, inside core.submodular_greedy's policy routines, so it is
+NOT ticked here -- ticks accumulate per name and a second tick around the
+same span would double-count it). Nothing about the loop's control flow,
+ordering or arithmetic changed.
+
+`trace_rounds=True` additionally records one dict per Stage-2 round
+(subset, cost, lambda, reward, remaining budget) and returns it under
+'round_trace'. That is the honest home for the training trace: the
+'selected_subsets' list this function already returns is serialised into a
+SINGLE Excel cell by the runner, thousands of subsets long, stripped of the
+lambda and budget state that would make it interpretable. The trace keeps
+the state and lands in a JSONL sidecar. selected_subsets is unchanged and
+still returned, so nothing that consumed it breaks.
 """
 
 from __future__ import annotations
 
 import numpy as np
 
+from core.logging_utils import get_logger, tick
 from core.two_stage_utils import generate_view_combinations
 from core.submodular_greedy import (
     # Shared policy vocabulary -- core is the canonical definition, so this
@@ -89,6 +107,8 @@ from core.multiclass_common import (
 )
 
 LP_ACTION_SPACE = {"lp_chain": "chain", "lp_full": "full", "lp_full_opt": "full"}
+
+_log = get_logger("afa.two_stage")
 
 
 # Mask-space prediction
@@ -134,7 +154,8 @@ def run_alg_greedy_multiclass(x, y, centers, costs, T1, training_budget, rng,
                               step_size=1.0, lambda_max=10.0,
                               pred_rule="nearest_center",
                               force_free=True, reward_update="subsets",
-                              true_means=None, reward_estimate="surrogate"):
+                              true_means=None, reward_estimate="surrogate",
+                              trace_rounds=False):
     """Greedy counterpart of two_stage_multiclass.run_alg_multiclass.
 
     Parameters
@@ -186,15 +207,23 @@ def run_alg_greedy_multiclass(x, y, centers, costs, T1, training_budget, rng,
     force_free : bool, default True
         Passed through to greedy_oracle -- keeps the free view(s) in every
         acquired subset, matching EXP4's and the LP's invariant.
+    trace_rounds : bool, default False
+        Record one dict per Stage-2 round under the returned 'round_trace'
+        key: round index, acquired subset, its cost, lambda, the 0/1
+        reward, and the budget left afterwards. OFF by default -- it is
+        O(T2) dicts per sweep cell, which is the same order as the
+        selected_subsets list already built, but there is no reason to pay
+        it on runs that will not look at it.
 
     Returns
     -------
     dict with the SAME keys run_alg_multiclass returns (so the runner and
     run_proposed_methods.normalize_two_stage_mc need no changes), plus
     'centers', 'est_counts', 'acquisition', 'avg_views_acquired',
-    'n_unique_masks'. 'warm_start' is always False -- there is no expert
-    weight vector to warm-start here; the Stage-1 information enters
-    through the centres and (via stage1_counts) the optimism bonus instead.
+    'n_unique_masks', 'round_trace', 'n_budget_fallbacks'. 'warm_start' is
+    always False -- there is no expert weight vector to warm-start here;
+    the Stage-1 information enters through the centres and (via
+    stage1_counts) the optimism bonus instead.
     """
     if acquisition not in ACQUISITION_MODES:
         raise ValueError(f"acquisition must be one of {ACQUISITION_MODES}, "
@@ -202,7 +231,7 @@ def run_alg_greedy_multiclass(x, y, centers, costs, T1, training_budget, rng,
     if reward_update not in REWARD_UPDATE_SCOPES:
         raise ValueError(f"reward_update must be one of {REWARD_UPDATE_SCOPES}, "
                          f"got {reward_update!r}")
-    
+
     validate_reward_estimate(reward_estimate)
     use_lp = acquisition in LP_ACTION_SPACE
     is_oracle = acquisition in ORACLE_ACQUISITION_MODES
@@ -221,6 +250,9 @@ def run_alg_greedy_multiclass(x, y, centers, costs, T1, training_budget, rng,
     total_samples = len(x)
     T2 = total_samples - T1
     if T2 <= 0:
+        _log.warning("Stage 2 has NO rounds (T1=%d >= n_train=%d) -- returning an "
+                     "empty result; the caller will record this cell as a failure",
+                     T1, total_samples)
         return {}
 
     costs = np.asarray(costs, dtype=np.float64)
@@ -241,6 +273,17 @@ def run_alg_greedy_multiclass(x, y, centers, costs, T1, training_budget, rng,
     training_budget_spent = stage1_budget_spent
     training_remaining_budget = float(training_budget - stage1_budget_spent)
     remaining_training_budget_per_sample = training_remaining_budget / T2
+
+    if training_remaining_budget <= 0:
+        # Stage 1 consumed the entire training pool, so Stage 2 is the
+        # free-view fallback for every one of its T2 rounds regardless of
+        # acquisition mode. A legitimate configuration (high init_fraction,
+        # low budget_fraction) whose rows are nonetheless not a read on the
+        # acquisition policy at all -- worth saying out loud.
+        _log.warning("Stage 1 (T1=%d) consumed the whole training budget "
+                     "(%.4f spent of %.4f); all %d Stage-2 rounds will use the "
+                     "free-view fallback and acquisition=%r is inert",
+                     T1, stage1_budget_spent, training_budget, T2, acquisition)
 
     # ── empirical/enumerated arm state ──
     # Used by lp_chain/lp_full/ucb_argmax/hedge and by greedy when
@@ -312,6 +355,12 @@ def run_alg_greedy_multiclass(x, y, centers, costs, T1, training_budget, rng,
         else:
             r_hat, combo_counts = stage1_combo_rewards(x, y, est_centers, T1, combos, nviews, pred_rule=pred_rule)
 
+    _log.debug("Stage 2 start: acquisition=%s, reward_estimate=%s, T1=%d, T2=%d, "
+               "n_arms=%s, budget left %.4f (%.6f/round)",
+               acquisition, reward_estimate, T1, T2,
+               (len(combos) if combos is not None else 0),
+               training_remaining_budget, remaining_training_budget_per_sample)
+
     lambda_t = 0.0
 
     predictions = []
@@ -325,6 +374,8 @@ def run_alg_greedy_multiclass(x, y, centers, costs, T1, training_budget, rng,
     # appended only after the hard remaining-budget fallback, so this is the
     # actual acquired subset for every training sample, in training order.
     selected_subsets = [tuple(range(1, nviews + 1)) for _ in range(T1)]
+    round_trace = [] if trace_rounds else None
+    n_budget_fallbacks = 0
     errors = 0
 
     p_oracle = None
@@ -339,6 +390,9 @@ def run_alg_greedy_multiclass(x, y, centers, costs, T1, training_budget, rng,
         round_idx = t - T1
         # ============================================================
         # 1. ACQUISITION
+        #    NOT ticked here -- core.submodular_greedy's policy routines
+        #    carry @timed("t_acquisition") themselves, and a tick around
+        #    this block would count the same span a second time.
         # ============================================================
         if training_remaining_budget <= 0:
             # Budget exhausted: free-view fallback is absorbing.
@@ -410,13 +464,15 @@ def run_alg_greedy_multiclass(x, y, centers, costs, T1, training_budget, rng,
         if training_remaining_budget < cost:
             mask = free_only_mask.copy()
             cost = float(np.sum(costs[mask]))
+            n_budget_fallbacks += 1
         if is_hedge:
             resource_z = np.array([1.0, cost], dtype=np.float64,)
             hedge_v *= ((1.0 + hedge_epsilon) ** resource_z)
         # ============================================================
         # 3. PREDICTION / REWARD
         # ============================================================
-        y_hat, score = predict_mask_multiclass(x[t], est_centers, mask, return_score=True, pred_rule=pred_rule)
+        with tick("t_predict"):
+            y_hat, score = predict_mask_multiclass(x[t], est_centers, mask, return_score=True, pred_rule=pred_rule)
         y_true = int(y[t])
         reward = float(y_hat == y_true)
         lagrangian_reward = reward - lambda_t * cost
@@ -436,35 +492,57 @@ def run_alg_greedy_multiclass(x, y, centers, costs, T1, training_budget, rng,
         # ============================================================
 
         if (use_lp or empirical_est or is_argmax or is_hedge) and not is_oracle:
-            played_bits = mask_to_bits(mask)
-            if reward_update == "selected":
-                # Only the actually played subset receives an observation.
-                j0 = bit_index.get(played_bits)
-                targets = ([] if j0 is None else [(int(j0), reward)])
-            else:
-                # Every arm contained in the acquired subset is observable.
-                contained_idx = np.flatnonzero((arm_bits & played_bits) == arm_bits)
-                targets = []
-                for k in contained_idx:
-                    m_k = combo_masks[k]
-                    y_sub = predict_mask_multiclass(x[t], est_centers, m_k, pred_rule=pred_rule,)
-                    targets.append((int(k), float(y_sub == y_true),))
-            for j0, r_obs in targets:
-                combo_counts[j0] += 1.0
-                r_hat[j0] += (r_obs - r_hat[j0] ) / combo_counts[j0]
+            with tick("t_reward_update"):
+                played_bits = mask_to_bits(mask)
+                if reward_update == "selected":
+                    # Only the actually played subset receives an observation.
+                    j0 = bit_index.get(played_bits)
+                    targets = ([] if j0 is None else [(int(j0), reward)])
+                else:
+                    # Every arm contained in the acquired subset is observable.
+                    contained_idx = np.flatnonzero((arm_bits & played_bits) == arm_bits)
+                    targets = []
+                    for k in contained_idx:
+                        m_k = combo_masks[k]
+                        y_sub = predict_mask_multiclass(x[t], est_centers, m_k, pred_rule=pred_rule,)
+                        targets.append((int(k), float(y_sub == y_true),))
+                for j0, r_obs in targets:
+                    combo_counts[j0] += 1.0
+                    r_hat[j0] += (r_obs - r_hat[j0] ) / combo_counts[j0]
 
         # ============================================================
         # 5. DUAL UPDATE
         # ============================================================
         if acquisition in ("greedy",) + ARGMAX_ACQUISITION_MODES:
-            raw_lambda = (lambda_t + step_size * (cost - remaining_training_budget_per_sample))
-            lambda_t = max(0.0, min(lambda_max, raw_lambda),)
+            with tick("t_dual_update"):
+                raw_lambda = (lambda_t + step_size * (cost - remaining_training_budget_per_sample))
+                lambda_t = max(0.0, min(lambda_max, raw_lambda),)
         # ============================================================
         # 6. BUDGET BOOKKEEPING
         # ============================================================
         training_remaining_budget -= cost
         training_budget_spent += cost
 
+        if round_trace is not None:
+            # Recorded AFTER the bookkeeping so remaining_budget is the
+            # post-round figure -- the one that explains the NEXT round's
+            # choice, which is what makes a trace readable top to bottom.
+            round_trace.append({
+                "round": round_idx,
+                "t": t,
+                "subset": (np.flatnonzero(mask) + 1).tolist(),
+                "n_views": int(mask.sum()),
+                "cost": cost,
+                "lambda": float(lambda_t),
+                "reward": reward,
+                "lagrangian_reward": lagrangian_reward,
+                "remaining_budget": float(training_remaining_budget),
+            })
+
+    if n_budget_fallbacks:
+        _log.info("Stage 2: %d/%d rounds (%.1f%%) hit the hard budget check and fell "
+                  "back to the free view", n_budget_fallbacks, T2,
+                  100.0 * n_budget_fallbacks / max(1, T2))
 
     error_rate = errors / len(reward_trace)
     avg_reward = float(np.mean(reward_trace))
@@ -496,4 +574,6 @@ def run_alg_greedy_multiclass(x, y, centers, costs, T1, training_budget, rng,
         'avg_views_acquired': float(np.mean(views_trace)),
         'n_unique_masks': len(seen_masks),
         'selected_subsets': selected_subsets,
+        'round_trace': round_trace,
+        'n_budget_fallbacks': n_budget_fallbacks,
     }

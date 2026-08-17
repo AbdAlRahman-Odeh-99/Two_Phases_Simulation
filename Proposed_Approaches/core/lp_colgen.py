@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 core/lp_colgen.py
- 
+
 Column-generation replacement for the stochastic inference LP,
 ported from constrained_supervised_training_submodular_gmm2c.ipynb's
 `optimal_branch_and_bound`. Solves the SAME linear program that
@@ -9,7 +9,7 @@ ported from constrained_supervised_training_submodular_gmm2c.ipynb's
 on view subsets, subject to a per-round budget constraint and the
 probability simplex), but WITHOUT ever materializing the full
 `2**nviews - 1` power set of subsets.
- 
+
 Instead, it solves a small "restricted master problem" LP over a growing
 set of discovered columns (subsets), and at each iteration uses the
 master problem's dual variables to run a pruned branch-and-bound search
@@ -18,22 +18,22 @@ cost -- i.e. one that would improve the LP objective if added. This
 relies on the reward function (`lp_reward`) being monotone in the
 included views, so the "assume every remaining feature gets added" bound
 is a valid relaxation for pruning.
- 
+
 `lp_reward` uses the SAME formula as `gain_func` / the notebook's
 `optimal_branch_and_bound` (which itself calls `gain_func`, with the
 extra 0.5 factor in its argument) -- NOT the no-0.5 `norm.sf(sqrt(snr))`
 formula this codebase's `combo_reward_estimates` currently uses. See
 `lp_reward`'s own docstring for the exact discrepancy.
- 
+
 This makes inference tractable at ANY nviews, including physionet (41) and
 miniboone (50), where `enumerate_subsets(nviews)` cannot even be built in
 memory, let alone optimized over.
- 
+
 Shared by gmm_2class_submodular_asymmetric.py and
 gmm_2class_bandit_asymmetric.py -- both use the same reward-formula
 convention questions (gain_func vs. combo_reward_estimates), so one
 pricing routine serves both.
- 
+
 One deliberate adaptation relative to the notebook's version: the free
 view (index 0) is seeded as the initial active column instead of starting
 column generation from the empty set, matching this codebase's "free view
@@ -41,15 +41,38 @@ always observed" convention (see `enumerate_subsets` / `greedy_oracle` /
 `get_subset` in the algorithm files). The branch-and-bound pricing
 subproblem then only ever branches over PAID views (indices 1..nviews-1);
 the free view is fixed True in every candidate subset it proposes.
+
+=== Instrumentation note ===
+Both solvers split their loop into the two halves that actually cost
+something, and time them separately: t_master_lp for the restricted-master
+linprog call and t_pricing for the branch-and-bound subproblem, with
+n_colgen_iters counting the rounds. This is the decomposition the previous
+single inference_time_sec could not give: at 40+ views the pricing search
+dominates and the master is free, while at low view counts with many
+discovered columns the reverse can hold, and the two point at completely
+different fixes.
+
+COLGEN_ITER_WARN below is a WARNING THRESHOLD, not a cap -- the loop's
+termination conditions are unchanged. It exists because an inference solve
+that quietly takes thousands of iterations is a real failure mode with no
+visible symptom other than a slow job.
 """
- 
+
 import math
- 
+
 import numba
 import numpy as np
 import scipy.optimize as opt
 from sklearn.metrics import f1_score, roc_auc_score
+from core.logging_utils import bump, get_logger, tick
 from core.submodular_greedy import multiclass_reward, bhattacharyya_accuracy_proxy, pairwise_diff_sq_from_means
+
+#: Iterations after which column generation is reported as suspicious.
+#: Purely diagnostic -- nothing is truncated.
+COLGEN_ITER_WARN = 500
+
+_log = get_logger("afa.colgen")
+
 
 @numba.njit
 def gain_func(snrs):
@@ -87,7 +110,7 @@ def solve_lp_policy_colgen(est_means, costs, inference_budget, n_inference, nois
             # FIXED
             guaranteed_penalty = -(y_ub * np.sum(costs[current_selection]) + y_eq)
             optimistic_bound = -max_potential_reward + guaranteed_penalty
-            
+
             if optimistic_bound > best_reduced_cost:
                 return  # prune -- this branch cannot beat what we have
 
@@ -118,32 +141,54 @@ def solve_lp_policy_colgen(est_means, costs, inference_budget, n_inference, nois
         return best_subset, best_reduced_cost
 
     opt_dist = np.array([1.0])
+    n_iter = 0
     while True:
+        n_iter += 1
+        bump("n_colgen_iters")
+        if n_iter == COLGEN_ITER_WARN:
+            _log.warning("binary column generation still running after %d iterations "
+                         "(%d active columns, nviews=%d, budget_ratio=%.6g) -- "
+                         "not truncating, but this solve is pathological",
+                         n_iter, len(active_c), nviews, budget_ratio)
         # --- Step A: Master Problem ---
-        obj_map = -np.array(active_c)
-        A_ub = np.array([active_g])
-        b_ub = np.array([budget_ratio])
-        A_eq = np.ones((1, len(active_c)))
-        b_eq = np.array([1.0])
-        res_rmp = opt.linprog(obj_map, A_ub=A_ub, b_ub=b_ub, A_eq=A_eq, b_eq=b_eq, bounds=(0, None), method="highs")
-        y_ub = res_rmp.ineqlin.marginals[0] if res_rmp.ineqlin is not None else 0.0
-        y_eq = res_rmp.eqlin.marginals[0] if res_rmp.eqlin.marginals is not None else 0.0
+        with tick("t_master_lp"):
+            obj_map = -np.array(active_c)
+            A_ub = np.array([active_g])
+            b_ub = np.array([budget_ratio])
+            A_eq = np.ones((1, len(active_c)))
+            b_eq = np.array([1.0])
+            res_rmp = opt.linprog(obj_map, A_ub=A_ub, b_ub=b_ub, A_eq=A_eq, b_eq=b_eq, bounds=(0, None), method="highs")
+            y_ub = res_rmp.ineqlin.marginals[0] if res_rmp.ineqlin is not None else 0.0
+            y_eq = res_rmp.eqlin.marginals[0] if res_rmp.eqlin.marginals is not None else 0.0
         # --- Step B: Run Branch and Bound ---
         # This replaces the giant matrix search
-        new_subset, min_reduced_cost = solve_subproblem_bb(y_ub, y_eq)
+        with tick("t_pricing"):
+            new_subset, min_reduced_cost = solve_subproblem_bb(y_ub, y_eq)
         opt_dist = res_rmp.x
         # --- Step C: Check and Update -
         if new_subset is None or min_reduced_cost >= -thres:
             break  # no improving column left -- optimal
-            
+
         # Check if the new subset is already in the active set to prevent infinite loops
         is_duplicate = any(np.array_equal(new_subset, s) for s in active_subsets)
         if is_duplicate:
+            # Pricing re-proposed a column it had already generated: the
+            # duplicate guard below is what stops an infinite loop, so
+            # reaching it means the solve terminated on a degeneracy rather
+            # than on optimality. Previously indistinguishable from a clean
+            # exit; now it says so.
+            _log.warning("binary column generation stopped on a DUPLICATE column at "
+                         "iteration %d (%d active columns) -- the returned policy is "
+                         "the last feasible master solution, not a certified optimum",
+                         n_iter, len(active_c))
             break
 
         active_subsets.append(new_subset)
         active_c.append(gain_func(mean_diff_sq[new_subset]))
         active_g.append(float(np.sum(costs[new_subset])))
+
+    _log.debug("binary colgen: %d iterations, %d columns, nviews=%d",
+               n_iter, len(active_subsets), nviews)
 
     probs = np.clip(opt_dist, 0, None)
     probs = probs / probs.sum() if probs.sum() > 0 else np.ones(len(active_subsets)) / len(active_subsets)
@@ -232,29 +277,46 @@ def solve_lp_policy_colgen_multiclass(est_means, costs, inference_budget,
         return best_subset, best_reduced_cost
 
     opt_dist = np.array([1.0])
+    n_iter = 0
     while True:
-        obj_map = -np.array(active_c)
-        A_ub = np.array([active_g])
-        b_ub = np.array([budget_ratio])
-        A_eq = np.ones((1, len(active_c)))
-        b_eq = np.array([1.0])
-        res_rmp = opt.linprog(obj_map, A_ub=A_ub, b_ub=b_ub, A_eq=A_eq,
-                               b_eq=b_eq, bounds=(0, None), method="highs")
-        y_ub = res_rmp.ineqlin.marginals[0] if res_rmp.ineqlin is not None else 0.0
-        y_eq = res_rmp.eqlin.marginals[0] if res_rmp.eqlin.marginals is not None else 0.0
+        n_iter += 1
+        bump("n_colgen_iters")
+        if n_iter == COLGEN_ITER_WARN:
+            _log.warning("multiclass column generation still running after %d "
+                         "iterations (%d active columns, nviews=%d, "
+                         "budget_ratio=%.6g) -- not truncating, but this solve is "
+                         "pathological", n_iter, len(active_c), nviews, budget_ratio)
+        with tick("t_master_lp"):
+            obj_map = -np.array(active_c)
+            A_ub = np.array([active_g])
+            b_ub = np.array([budget_ratio])
+            A_eq = np.ones((1, len(active_c)))
+            b_eq = np.array([1.0])
+            res_rmp = opt.linprog(obj_map, A_ub=A_ub, b_ub=b_ub, A_eq=A_eq,
+                                   b_eq=b_eq, bounds=(0, None), method="highs")
+            y_ub = res_rmp.ineqlin.marginals[0] if res_rmp.ineqlin is not None else 0.0
+            y_eq = res_rmp.eqlin.marginals[0] if res_rmp.eqlin.marginals is not None else 0.0
 
-        new_subset, min_reduced_cost = solve_subproblem_bb(y_ub, y_eq)
+        with tick("t_pricing"):
+            new_subset, min_reduced_cost = solve_subproblem_bb(y_ub, y_eq)
         opt_dist = res_rmp.x
         if new_subset is None or min_reduced_cost >= -thres:
             break  # no improving column left -- optimal
 
         is_duplicate = any(np.array_equal(new_subset, s) for s in active_subsets)
         if is_duplicate:
+            _log.warning("multiclass column generation stopped on a DUPLICATE column "
+                         "at iteration %d (%d active columns) -- the returned policy "
+                         "is the last feasible master solution, not a certified "
+                         "optimum", n_iter, len(active_c))
             break
 
         active_subsets.append(new_subset)
         active_c.append(reward_of(new_subset))
         active_g.append(float(np.sum(costs[new_subset])))
+
+    _log.debug("multiclass colgen: %d iterations, %d columns, nviews=%d",
+               n_iter, len(active_subsets), nviews)
 
     probs = np.clip(opt_dist, 0, None)
     probs = probs / probs.sum() if probs.sum() > 0 else np.ones(len(active_subsets)) / len(active_subsets)
@@ -271,12 +333,12 @@ def sample_lp_colgen_policy(X_inference, Y_inference, learned_centers, costs,
     in both files; the only real difference between the two callers is how
     `label_map` gets built, so that's now the caller's job, not this
     function's.
- 
+
     `predict_fn` is passed in (rather than imported here) to avoid a
     circular import: two_stage_asymmetric.py imports from core/, so core/
     cannot import back from two_stage_asymmetric.py. Pass
     `predict_single_combination` from two_stage_asymmetric.py.
- 
+
     Solves the LP via solve_lp_policy_colgen (0.5-factor `lp_reward`
     convention), converts the discovered 0-indexed boolean masks to this
     codebase's 1-indexed combo-tuple convention (index 0 == view 1, the
@@ -284,57 +346,70 @@ def sample_lp_colgen_policy(X_inference, Y_inference, learned_centers, costs,
     to a running budget, falling back to the free view alone if the budget
     would go negative -- identical policy-execution logic in both former
     duplicates.
- 
+
     Returns
     -------
     dict with keys: combos_list, probabilities, inference_accuracy,
     inference_error, inference_f1, inference_auroc, actual_cost.
     """
     n = len(X_inference)
- 
-    masks, probs = solve_lp_policy_colgen(
-        est_means=learned_centers, costs=costs,
-        inference_budget=inference_budget, n_inference=n, noise_var=noise_var,
-    )
+
+    with tick("t_inference_solve"):
+        masks, probs = solve_lp_policy_colgen(
+            est_means=learned_centers, costs=costs,
+            inference_budget=inference_budget, n_inference=n, noise_var=noise_var,
+        )
     combos_list = [tuple(i + 1 for i, flag in enumerate(m) if flag) for m in masks]
     combo_costs_discovered = {c: float(np.sum(costs[np.array(c) - 1])) for c in combos_list}
     probabilities = np.clip(probs, 0, 1)
     probabilities /= np.sum(probabilities)
- 
+
     actual_inference_rewards = []
     actual_inference_cost = 0.0
     remaining_inference_budget = inference_budget
- 
+
     sign_factor = 1.0 if label_map.get(0, 0) == 0 else -1.0
     y_pred_mapped = np.zeros(n, dtype=int)
     evidence_for_class1 = np.zeros(n)
- 
-    for i in range(n):
-        sampled_idx = rng.choice(len(combos_list), p=probabilities)
-        sampled_combo = combos_list[sampled_idx]
- 
-        cost_of_combo = combo_costs_discovered[sampled_combo]
-        if remaining_inference_budget - cost_of_combo < 0:
-            sampled_combo = (1,)  # fallback: the free view alone
-            cost_of_combo = costs[0]
-        else:
-            remaining_inference_budget -= cost_of_combo
-            actual_inference_cost += cost_of_combo
- 
-        raw_pred, score = predict_fn(X_inference[i], learned_centers, sampled_combo, return_score=True)
-        matched_pred = label_map.get(raw_pred, raw_pred)
-        actual_inference_rewards.append(int(matched_pred == Y_inference[i]))
-        y_pred_mapped[i] = matched_pred
-        evidence_for_class1[i] = sign_factor * score
- 
+    n_fallbacks = 0
+
+    with tick("t_inference_sample"):
+        for i in range(n):
+            sampled_idx = rng.choice(len(combos_list), p=probabilities)
+            sampled_combo = combos_list[sampled_idx]
+
+            cost_of_combo = combo_costs_discovered[sampled_combo]
+            if remaining_inference_budget - cost_of_combo < 0:
+                sampled_combo = (1,)  # fallback: the free view alone
+                cost_of_combo = costs[0]
+                n_fallbacks += 1
+            else:
+                remaining_inference_budget -= cost_of_combo
+                actual_inference_cost += cost_of_combo
+
+            raw_pred, score = predict_fn(X_inference[i], learned_centers, sampled_combo, return_score=True)
+            matched_pred = label_map.get(raw_pred, raw_pred)
+            actual_inference_rewards.append(int(matched_pred == Y_inference[i]))
+            y_pred_mapped[i] = matched_pred
+            evidence_for_class1[i] = sign_factor * score
+
+    if n_fallbacks:
+        # The budget ran out partway through inference, so the tail of the
+        # test set was classified on the free view alone. That is a
+        # legitimate policy outcome, but it depresses inference_accuracy for
+        # a reason nothing in the workbook otherwise records.
+        _log.info("inference budget exhausted on %d/%d rounds (%.1f%%) -- those "
+                  "rounds fell back to the free view", n_fallbacks, n,
+                  100.0 * n_fallbacks / max(1, n))
+
     inference_accuracy = float(np.mean(actual_inference_rewards))
- 
+
     inference_f1 = f1_score(Y_inference, y_pred_mapped, zero_division=0)
     try:
         inference_auroc = roc_auc_score(Y_inference, evidence_for_class1)
     except ValueError:
         inference_auroc = float("nan")
- 
+
     return {
         "combos_list": combos_list,
         "probabilities": probabilities,

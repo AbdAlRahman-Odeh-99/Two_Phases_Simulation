@@ -24,19 +24,37 @@ instead of living in differently-shaped workbooks.
     python run_proposed_methods.py --method adaptive --dataset synthetic --acquisition lp_full_opt --max-modalities 8
     python run_proposed_methods.py --method adaptive --dataset synthetic --acquisition ucb_argmax --max-modalities 8
     python run_proposed_methods.py --method two_stage --dataset synthetic --acquisition ucb_argmax --max-modalities 8
+    # salvage a workbook from a job that was killed mid-sweep:
+    python run_proposed_methods.py --rebuild-from results/<run_id>.rows.jsonl
 
 Run `python run_proposed_methods.py --help` for the full flag list.
+
+=== Observability ===
+Every run now has an identity (run_id) shared by four artefacts:
+
+    logs/{run_id}.log             console + DEBUG detail, timestamped
+    results/{run_id}.manifest.json  git commit + dirty flag, argv, resolved
+                                    args, package versions, hostname, PBS
+                                    job id, timing, failures
+    results/{run_id}.rows.jsonl   every row, appended and flushed as it is
+                                    produced -- the crash checkpoint
+    results/{...}.xlsx            the workbook, unchanged in shape apart
+                                    from appended columns and a Run Info
+                                    sheet mirroring the manifest
+
+See core/logging_utils.py for the rationale behind each. The run_id is
+derived from the output workbook's stem, so all four sort together.
 """
 
 from __future__ import annotations
 
 import argparse
+import sys
 import time
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
-from openpyxl import load_workbook
 
 from core.datasets import (
     ALL_DATASETS,
@@ -50,7 +68,16 @@ from core.datasets import (
     SYNTHETIC_N_VIEWS,
     SYNTHETIC_SEED,
 )
-from core.excel_utils import _style_sheet, serialize_selected_subsets
+from core.excel_utils import serialize_selected_subsets, style_and_save
+from core.logging_utils import (
+    EXCEL_TIMING_COLUMNS,
+    TIMING_COLUMNS,
+    excel_timing_columns,
+    get_logger,
+    read_manifest,
+    read_rows_jsonl,
+    setup_run,
+)
 
 import gmm_submodular.gmm_multiclass_submodular_runner as multiclass_runner
 import two_stage_greedy.two_stage_multiclass_greedy_runner as two_stage_mc_greedy_runner
@@ -61,11 +88,14 @@ from core.multiclass_common import PRED_RULES
 # from per-method copies the driver would have to assert were in sync.
 from core.submodular_greedy import (
     ACQUISITION_MODES,
+    ARGMAX_ACQUISITION_MODES,
     ORACLE_ACQUISITION_MODES,
     REWARD_ESTIMATES,
     uses_empirical_arm_rewards as _uses_empirical_arm_rewards,
     REWARD_UPDATE_SCOPES,
 )
+
+log = get_logger("afa.driver")
 
 
 METHODS = ("adaptive", "two_stage")
@@ -87,10 +117,41 @@ FILENAME_METHOD_LABELS = {"two_stage": "two_stage"}
 DEFAULT_MAX_MODALITIES = {"adaptive": None, "two_stage": None}
 
 
+def _nan(d, key):
+    """d[key] if present, else NaN.
+
+    Used throughout the normalizers below. Before per-cell failure
+    isolation existed, every row was complete and direct indexing was safe;
+    now a failed cell contributes a row carrying only its coordinates and
+    its status, and a KeyError there would defeat the entire point of
+    surviving the failure.
+    """
+    v = d.get(key, np.nan)
+    return np.nan if v is None else v
+
+
 # ─────────────────────────────────────────────────────────────────────────
 # Normalization: reshape each method's native results into one common
 # row schema (a list of flat dicts), ready for pd.DataFrame(rows).
 # ─────────────────────────────────────────────────────────────────────────
+def _timing_fragment(source, indexer=None):
+    """{Excel column name: value} for the timing block.
+
+    `source` is either a flat row dict (two_stage) or the per-fraction
+    dict-of-lists (adaptive), in which case `indexer` is the seed index.
+    """
+    out = {}
+    for key in TIMING_COLUMNS:
+        col = EXCEL_TIMING_COLUMNS[key]
+        if indexer is None:
+            out[col] = _nan(source, key)
+        else:
+            series = source.get(key)
+            out[col] = (series[indexer]
+                        if series is not None and indexer < len(series) else np.nan)
+    return out
+
+
 def _normalize_frac_keyed_results(results, budget_fractions, seeds, dataset_name, method_name,
                                    feedback=np.nan, n_classes=2,
                                    acquisition=np.nan, reward_estimate=np.nan,
@@ -143,7 +204,10 @@ def _normalize_frac_keyed_results(results, budget_fractions, seeds, dataset_name
                 "Num Arms": r["n_arms"][i] if "n_arms" in r else np.nan,
                 "Selected Subsets": serialize_selected_subsets(
                     r["selected_subsets"][i]),
+                "Status": (r["status"][i] if "status" in r else "ok"),
+                "Error": (r["error_msg"][i] if "error_msg" in r else ""),
             }
+            row.update(_timing_fragment(r, i))
             rows.append(row)
     return rows
 
@@ -163,49 +227,118 @@ def normalize_two_stage(all_results, dataset_name,
     acquisition: the run's acquisition policy as one string, for the
     shared 'Acquisition' column -- two_stage passes
 the same "greedy" / "lp_chain+subsets" / "lp_full+selected" strings
-    adaptive reports, since both methods now share the axis."""
+    adaptive reports, since both methods now share the axis.
+
+    Every field is read through _nan(), so a status="error" row -- which
+    carries its coordinates and nothing else -- normalizes to a row of NaNs
+    instead of raising."""
     rows = []
     for d in all_results:
-        rows.append({
+        row = {
             "Method": method_name,
             "Feedback": np.nan,
             "Acquisition": acquisition,
             "Reward Estimate": d.get("reward_estimate", reward_estimate),
             "Alpha UCB": d.get("alpha_ucb", alpha_ucb),
-            "Num Classes": d.get("nclasses", np.nan),
+            "Num Classes": _nan(d, "nclasses"),
             "Warm Start": bool(d.get("warm_start", False)),
             "Dataset": dataset_name,
-            "Seed": d["seed"],
-            "Budget Fraction": d["budget_fraction"],
-            "Init Fraction": d["init_fraction"],
-            "Train Reward": d["avg_reward"],
-            "Train F1": d["train_f1"],
-            "Train AUROC": d["train_auroc"],
-            "Inference Reward": d["inference_accuracy"],
-            "Inference F1": d["inference_f1"],
-            "Inference AUROC": d["inference_auroc"],
-            "Total Reward": d["total_reward"],
-            "Two Stage Error": d["two_stage_error"],
-            "Init Error": d["init_error"],
-            "Train Spent": d["training_budget_spent"],
-            "Inference Spent": d["inference_actual_cost"],
-            "Train Time (s)": d["train_time_sec"],
-            "Inference Time (s)": d["inference_time_sec"],
-            "Seed Time (s)": d["seed_time_sec"],
-            "Num Masks Inference": d.get("num_masks_inference", np.nan),
-            "Train Samples": d["n_train"],
-            "Inference Samples": d["n_test"],
-            "Train Budget": d["training_budget"],
-            "Inference Budget": d["inference_budget"],
-            "Num Arms": d.get("n_arms", np.nan),
+            "Seed": _nan(d, "seed"),
+            "Budget Fraction": _nan(d, "budget_fraction"),
+            "Init Fraction": _nan(d, "init_fraction"),
+            "Train Reward": _nan(d, "avg_reward"),
+            "Train F1": _nan(d, "train_f1"),
+            "Train AUROC": _nan(d, "train_auroc"),
+            "Inference Reward": _nan(d, "inference_accuracy"),
+            "Inference F1": _nan(d, "inference_f1"),
+            "Inference AUROC": _nan(d, "inference_auroc"),
+            "Total Reward": _nan(d, "total_reward"),
+            "Two Stage Error": _nan(d, "two_stage_error"),
+            "Init Error": _nan(d, "init_error"),
+            "Train Spent": _nan(d, "training_budget_spent"),
+            "Inference Spent": _nan(d, "inference_actual_cost"),
+            "Train Time (s)": _nan(d, "train_time_sec"),
+            "Inference Time (s)": _nan(d, "inference_time_sec"),
+            "Seed Time (s)": _nan(d, "seed_time_sec"),
+            "Num Masks Inference": _nan(d, "num_masks_inference"),
+            "Train Samples": _nan(d, "n_train"),
+            "Inference Samples": _nan(d, "n_test"),
+            "Train Budget": _nan(d, "training_budget"),
+            "Inference Budget": _nan(d, "inference_budget"),
+            "Num Arms": _nan(d, "n_arms"),
             "Selected Subsets": d.get(
                 "Selected Subsets",
                 serialize_selected_subsets(d.get("selected_subsets", [])),
             ),
-        })
+            "Status": d.get("status", "ok"),
+            "Error": d.get("error_msg", ""),
+        }
+        row.update(_timing_fragment(d))
+        rows.append(row)
     return rows
 
 
+def normalize_adaptive_flat_rows(rows, dataset_name, feedback=np.nan, n_classes=np.nan,
+                                 acquisition=np.nan, reward_estimate=np.nan,
+                                 alpha_ucb=np.nan):
+    """Normalizer for adaptive rows read back from a .rows.jsonl checkpoint.
+
+    The checkpoint stores adaptive's cells FLAT (one dict per cell with its
+    seed and budget fraction) rather than in the dict-of-lists shape
+    run_experiment returns, because a checkpoint is written one cell at a
+    time -- that is the whole point of it. So rebuilding needs this
+    counterpart to _normalize_frac_keyed_results. Used only by
+    --rebuild-from.
+    """
+    out = []
+    for d in rows:
+        row = {
+            "Method": "adaptive",
+            "Feedback": feedback,
+            "Acquisition": acquisition,
+            "Reward Estimate": reward_estimate,
+            "Alpha UCB": alpha_ucb,
+            "Num Classes": n_classes,
+            "Warm Start": False,
+            "Dataset": dataset_name,
+            "Seed": _nan(d, "seed"),
+            "Budget Fraction": _nan(d, "budget_fraction"),
+            "Init Fraction": np.nan,
+            "Train Reward": _nan(d, "train_reward"),
+            "Train F1": _nan(d, "train_f1"),
+            "Train AUROC": _nan(d, "train_auroc"),
+            "Inference Reward": _nan(d, "inference_reward"),
+            "Inference F1": _nan(d, "inference_f1"),
+            "Inference AUROC": _nan(d, "inference_auroc"),
+            "Total Reward": _nan(d, "total_reward"),
+            "Two Stage Error": np.nan,
+            "Init Error": np.nan,
+            "Train Spent": _nan(d, "train_spent"),
+            "Inference Spent": _nan(d, "inference_spent"),
+            "Train Time (s)": _nan(d, "train_time_sec"),
+            "Inference Time (s)": _nan(d, "inference_time_sec"),
+            # seed_time_sec is only known once a seed's whole budget loop
+            # finishes, so a checkpoint written mid-seed does not have it.
+            "Seed Time (s)": _nan(d, "seed_time_sec"),
+            "Num Masks Inference": _nan(d, "num_masks_inference"),
+            "Train Samples": _nan(d, "n_train"),
+            "Inference Samples": _nan(d, "n_inference"),
+            "Train Budget": _nan(d, "train_budget"),
+            "Inference Budget": _nan(d, "inference_budget"),
+            "Num Arms": _nan(d, "n_arms"),
+            "Selected Subsets": "",   # not checkpointed -- see emit_row
+            "Status": d.get("status", "ok"),
+            "Error": d.get("error_msg", ""),
+        }
+        row.update(_timing_fragment(d))
+        out.append(row)
+    return out
+
+
+#: The unified schema. The first block is unchanged from before -- same
+#: names, same order -- and the observability columns are APPENDED, so an
+#: older workbook and a newer one still concatenate (pandas fills the
+#: missing new columns with NaN).
 UNIFIED_COLUMNS = [
     "Method", "Feedback", "Num Classes", "Warm Start", "Dataset", "Seed",
     "Budget Fraction", "Init Fraction",
@@ -220,7 +353,12 @@ UNIFIED_COLUMNS = [
     "Acquisition", "Reward Estimate", "Num Arms",
     "Alpha UCB",
     "Selected Subsets",
-]
+] + excel_timing_columns() + ["Status", "Error"]
+
+#: Columns that must never enter the numeric aggregation on the Summary
+#: sheet, beyond the grouping keys. Named once so save_unified_results_to_excel
+#: cannot drift from the column list above.
+NON_NUMERIC_COLUMNS = ["Seed", "Selected Subsets", "Status", "Error"]
 
 
 def _acquisition_label(acquisition, reward_update, reward_estimate="surrogate"):
@@ -244,7 +382,7 @@ def run_method(method, dataset, max_modalities, seeds, budget_fractions,
                 reward_update="subsets", reward_estimate="surrogate",
                 alpha_ucb=2.0, lr=1e-2,
                 acquisition="greedy"):
-    
+
     synthetic_n_views = max_modalities if max_modalities is not None else SYNTHETIC_N_VIEWS
 
     common_kwargs = dict(
@@ -256,50 +394,42 @@ def run_method(method, dataset, max_modalities, seeds, budget_fractions,
 
     uses_empirical_arm_rewards = _uses_empirical_arm_rewards(acquisition, reward_estimate)
     if (acquisition in ORACLE_ACQUISITION_MODES and reward_update != "subsets"):
-        print(
-            f"WARNING: --reward-update has no effect under --acquisition "
-            f"{acquisition} (its arm values come from the true means and "
-            f"are never scored); ignored."
-        )
+        log.warning(
+            "--reward-update has no effect under --acquisition %s (its arm values "
+            "come from the true means and are never scored); ignored.", acquisition)
     elif (not uses_empirical_arm_rewards and reward_update != "subsets"):
-        print(
-            "WARNING: --reward-update has no effect for this acquisition/"
-            "reward-estimate combination; ignored."
-        )
+        log.warning(
+            "--reward-update has no effect for this acquisition/reward-estimate "
+            "combination; ignored.")
     if acquisition in ORACLE_ACQUISITION_MODES and method == "adaptive" and feedback != "full":
-        print(f"NOTE: --acquisition {acquisition} gives the ACQUISITION policy "
-              f"the true means; the classifier still learns under --feedback "
-              f"{feedback}. This is not an oracle-classifier run.")
+        log.info("--acquisition %s gives the ACQUISITION policy the true means; the "
+                 "classifier still learns under --feedback %s. This is not an "
+                 "oracle-classifier run.", acquisition, feedback)
     if method != "adaptive" and feedback != "full":
-        print("WARNING: --feedback governs the CENTRE update, which only "
-              "adaptive has (two_stage holds its Stage-1 centres "
-              f"frozen); ignored for {method!r}. The arm-scoring analogue is "
-              "--reward-update subsets/selected.")
+        log.warning("--feedback governs the CENTRE update, which only adaptive has "
+                    "(two_stage holds its Stage-1 centres frozen); ignored for %r. "
+                    "The arm-scoring analogue is --reward-update subsets/selected.",
+                    method)
     if method != "adaptive" and lr != 1e-2:
-        print("WARNING: --lr is the complementary-label step in adaptive's "
-              f"--feedback bandit centre update; ignored for {method!r}, whose "
-              "centres are frozen.")
-    if method not in TWO_STAGE_FAMILY:
-        if (step_size, lambda_max) != (1.0, 10.0):
-            print("WARNING: --step-size / --lambda-max only apply to "
-                  f"{TWO_STAGE_FAMILY}; ignored for {method!r}.")
-        if pred_rule != "nearest_center":
-            print(f"WARNING: --pred-rule only applies to --method two_stage; "
-                  f"ignored for {method!r} (adaptive always uses its own "
-                  f"pairwise-vote rule, which is what --pred-rule pairwise_vote "
-                  f"makes two_stage match).")
+        log.warning("--lr is the complementary-label step in adaptive's --feedback "
+                    "bandit centre update; ignored for %r, whose centres are frozen.",
+                    method)
+    if pred_rule != "nearest_center":
+        log.warning("--pred-rule only applies to --method two_stage; ignored for %r.",
+                    method)
 
     if method == "adaptive":
         results = multiclass_runner.run_experiment(
             dataset, feedback=feedback,
             acquisition=acquisition, reward_update=reward_update,
             reward_estimate=reward_estimate, alpha_ucb=alpha_ucb, lr=lr,
+            step_size=step_size, lambda_max=lambda_max,
             synthetic_n_classes=synthetic_n_classes,
             run_inference=run_inference, image_pool_side=image_pool_side,
             image_data_home=image_data_home,
             **common_kwargs
         )
-        
+
         if dataset in MULTICLASS_SYNTHETIC_DATASETS:
             n_classes = synthetic_n_classes
         else:
@@ -334,17 +464,22 @@ def run_method(method, dataset, max_modalities, seeds, budget_fractions,
     raise ValueError(f"Unknown method {method!r}, choose from {METHODS}")
 
 
-def save_unified_results_to_excel(rows, filename):
+def save_unified_results_to_excel(rows, filename, info_rows=None):
     df = pd.DataFrame(rows, columns=UNIFIED_COLUMNS)
     group_cols = ["Method", "Feedback", "Acquisition", "Reward Estimate", "Alpha UCB",
                   "Num Classes", "Warm Start", "Dataset",
                   "Budget Fraction", "Init Fraction"]
     numeric_cols = [
         c for c in UNIFIED_COLUMNS
-        if c not in group_cols + ["Seed", "Selected Subsets"]
+        if c not in group_cols + NON_NUMERIC_COLUMNS
     ]
+    # Aggregate over SUCCESSFUL cells only. An isolated failure now
+    # contributes a NaN row rather than killing the sweep, and mean/std
+    # over a group containing it would otherwise be NaN for every metric --
+    # which would turn one lost cell back into one lost group.
+    ok = df[df["Status"] == "ok"] if "Status" in df.columns else df
     summary = (
-        df.groupby(group_cols, dropna=False)[numeric_cols]
+        ok.groupby(group_cols, dropna=False)[numeric_cols]
         .agg(["mean", "std"])
         .reset_index()
     )
@@ -356,11 +491,92 @@ def save_unified_results_to_excel(rows, filename):
         df.to_excel(writer, sheet_name="Detailed Results", index=False)
         summary.to_excel(writer, sheet_name="Summary", index=False)
 
-    wb = load_workbook(filename)
-    _style_sheet(wb["Detailed Results"])
-    _style_sheet(wb["Summary"])
-    wb.save(filename)
-    print(f"Results saved to {filename}")
+    style_and_save(filename, ["Detailed Results", "Summary"], info_rows=info_rows)
+    log.info("Results saved to %s", filename)
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# Salvage: rebuild a workbook from a killed run's checkpoint
+# ─────────────────────────────────────────────────────────────────────────
+def rebuild_from_checkpoint(source, output_xlsx=None):
+    """Turn results/{run_id}.rows.jsonl back into a workbook.
+
+    This is what the row checkpoint is FOR. A job killed at seed 8 of 10
+    used to leave nothing; now it leaves every completed cell on disk, and
+    this reads them back, normalizes them through exactly the same
+    functions a live run uses, and writes the same two sheets.
+
+    The run's arguments come from the sibling manifest, so the Method /
+    Dataset / Acquisition columns and the output filename are the real ones
+    rather than guesses. The output gets a _partial tag: these rows are a
+    prefix of the intended sweep, and a file that does not say so will
+    eventually be compared against a complete one as though it were.
+    """
+    p = Path(source)
+    if p.is_dir():
+        raise ValueError(f"{source!r} is a directory; pass the .rows.jsonl file "
+                         f"or the run_id")
+    if not p.exists():
+        # Accept a bare run_id as well as a path.
+        cand = Path("results") / f"{source}.rows.jsonl"
+        if not cand.exists():
+            raise FileNotFoundError(f"no checkpoint at {p} or {cand}")
+        p = cand
+
+    manifest_path = Path(str(p).replace(".rows.jsonl", ".manifest.json"))
+    manifest = read_manifest(manifest_path) if manifest_path.exists() else {}
+    if not manifest:
+        log.warning("no manifest beside %s -- rebuilding with unknown run settings; "
+                    "the Method/Dataset/Acquisition columns will be blank", p)
+    a = manifest.get("args", {}) or {}
+
+    rows_native = read_rows_jsonl(p)
+    if not rows_native:
+        raise ValueError(f"{p} contains no readable rows")
+    log.info("rebuilding from %s: %d rows, entry_point=%s",
+             p, len(rows_native), manifest.get("entry_point"))
+
+    method = a.get("method")
+    if method is None:
+        # A standalone runner's checkpoint has no --method; infer it from
+        # which entry point wrote the manifest.
+        method = "two_stage" if "two_stage" in str(manifest.get("entry_point", "")) \
+            else "adaptive"
+    dataset = a.get("dataset", "")
+    acquisition = _acquisition_label(a.get("acquisition", "greedy"),
+                                     a.get("reward_update", "subsets"),
+                                     a.get("reward_estimate", "surrogate"))
+
+    if method == "two_stage":
+        rows = normalize_two_stage(
+            rows_native, dataset, "two_stage", acquisition=acquisition,
+            reward_estimate=a.get("reward_estimate", np.nan),
+            alpha_ucb=a.get("alpha_ucb", np.nan))
+    else:
+        if dataset in MULTICLASS_SYNTHETIC_DATASETS:
+            n_classes = a.get("num_classes", np.nan)
+        else:
+            n_classes = DATASET_N_CLASSES.get(dataset, np.nan)
+        rows = normalize_adaptive_flat_rows(
+            rows_native, dataset, feedback=a.get("feedback", np.nan),
+            n_classes=n_classes, acquisition=acquisition,
+            reward_estimate=a.get("reward_estimate", np.nan),
+            alpha_ucb=a.get("alpha_ucb", np.nan))
+
+    if output_xlsx is None:
+        stem = a.get("output_xlsx") or manifest.get("output_xlsx")
+        if stem:
+            stem = Path(stem)
+            output_xlsx = str(stem.with_name(stem.stem + "_partial" + stem.suffix))
+        else:
+            output_xlsx = str(p).replace(".rows.jsonl", "_partial.xlsx")
+
+    info = [(k, v) for k, v in manifest.items()
+            if not isinstance(v, (dict, list))]
+    info.append(("rebuilt_from", str(p)))
+    info.append(("rebuilt_rows", len(rows)))
+    save_unified_results_to_excel(rows, output_xlsx, info_rows=info)
+    return output_xlsx
 
 
 if __name__ == "__main__":
@@ -369,7 +585,8 @@ if __name__ == "__main__":
                      "real AFA-Benchmark or synthetic dataset, and write results in one unified "
                      "schema."
     )
-    parser.add_argument("--method", choices=METHODS, required=True)
+    parser.add_argument("--method", choices=METHODS,
+                        help="Required for a normal run; omitted only with --rebuild-from.")
     parser.add_argument("--dataset", choices=ALL_DATASETS, default="synthetic")
     parser.add_argument("--data-path", type=str, default=None)
     parser.add_argument("--max-modalities", type=str, default=None,
@@ -460,7 +677,13 @@ if __name__ == "__main__":
                               "replay is what fills the table); --reward-estimate is inert, "
                               "since the empirical table is unconditional. Capped at "
                               "MAX_REWARD_ESTIMATE_VIEWS views like lp_full, and works on "
-                              "REAL data (nothing oracle about it).")
+                              "REAL data (nothing oracle about it)."
+                              "'hedge': the same full empirical arm table and UCB estimates "
+                              "as ucb_argmax, but selects the deterministic arm maximizing "
+                              "UCB(S) / (y_time + y_cost*cost(S)), where the resource weights "
+                              "are updated multiplicatively. It uses no OMD lambda. "
+                              "--reward-update is live, --reward-estimate is inert, and the "
+                              "same MAX_REWARD_ESTIMATE_VIEWS cap applies.")
     parser.add_argument("--reward-estimate",
                         choices=list(REWARD_ESTIMATES),
                         default="surrogate",
@@ -482,16 +705,16 @@ if __name__ == "__main__":
                               "(labels {0..K-1}). Every other dataset infers its class "
                               "count from the labels.")
     parser.add_argument("--step-size", type=float, default=1.0,
-                         help="two_stage only: Stage-2 OMD dual (lambda) ascent step size "
-                              "(default 1.0). Ignored for adaptive.")
+                         help="Adaptive and two_stage: OMD dual ascent step size for "
+                              "greedy and ucb_argmax. Ignored by LP acquisition modes.")
     parser.add_argument("--lambda-max", type=float, default=10.0,
-                         help="two_stage only: Stage-2 OMD dual variable clip ceiling "
-                              "(default 10.0). Ignored for adaptive.")
+                         help="Adaptive and two_stage: upper bound for the OMD dual "
+                              "variable under greedy and ucb_argmax. Ignored by LP modes.")
     parser.add_argument("--reward-update", choices=REWARD_UPDATE_SCOPES, default="subsets",
                          help="BOTH methods: how empirical arm rewards are updated. "
                               "'subsets' replays every arm contained in the acquired "
                               "subset; 'selected' updates only the played arm from its "
-                              "0/1 reward. Used by lp_chain/lp_full/ucb_argmax and by "
+                              "0/1 reward. Used by lp_chain/lp_full/ucb_argmax/hedge and by "
                               "greedy when --reward-estimate empirical. Ignored by "
                               "surrogate greedy and lp_full_opt.")
     parser.add_argument("--alpha-ucb", type=float, default=2.0,
@@ -537,7 +760,46 @@ if __name__ == "__main__":
                               "so this does NOT change accuracy -- it exists to confirm "
                               "two_stage and adaptive share a decision rule. Ignored for "
                               "adaptive (which always uses pairwise-vote intrinsically).")
+    # ── observability flags (see core/logging_utils.py) ──
+    parser.add_argument("--log-level", default="INFO",
+                         choices=("DEBUG", "INFO", "WARNING", "ERROR"),
+                         help="CONSOLE verbosity. logs/{run_id}.log always keeps DEBUG, so "
+                              "this only decides what competes for attention in the PBS .o "
+                              "file; nothing is lost by lowering it.")
+    parser.add_argument("--log-dir", default="logs",
+                         help="Directory for {run_id}.log (default: logs/, created if "
+                              "missing). On PBS point this at the same directory as the "
+                              "#PBS -o path so a job's two logs sit together.")
+    parser.add_argument("--trace-rounds", action="store_true",
+                         help="Record one row PER TRAINING ROUND (subset, cost, lambda, "
+                              "reward, remaining budget) to results/{run_id}.trace.jsonl, "
+                              "and drop the 'Selected Subsets' Excel cell, which is a "
+                              "strictly poorer encoding of the same thing. Off by default: "
+                              "it is O(n_train) records per sweep cell.")
+    parser.add_argument("--no-fine-timers", action="store_true",
+                         help="Disable the fine-grained timing buckets; the t_* columns "
+                              "become NaN. The original Train/Inference/Seed timings are "
+                              "unaffected either way.")
+    parser.add_argument("--rebuild-from", type=str, default=None,
+                         help="Skip the sweep entirely: rebuild a workbook from a previous "
+                              "run's results/{run_id}.rows.jsonl checkpoint (pass the path "
+                              "or just the run_id). Use this after a walltime kill or an OOM "
+                              "to recover every cell that completed. The output is tagged "
+                              "_partial, because it is a prefix of the intended sweep.")
     args = parser.parse_args()
+
+    if args.rebuild_from:
+        # No sweep, no run context -- this is a pure file-to-file operation
+        # and should not create a new run_id or a new log.
+        import logging
+        logging.basicConfig(level=getattr(logging, args.log_level),
+                            format="%(levelname).1s %(message)s")
+        out = rebuild_from_checkpoint(args.rebuild_from, args.output_xlsx)
+        log.info("rebuilt %s", out)
+        sys.exit(0)
+
+    if args.method is None:
+        parser.error("--method is required (omit it only with --rebuild-from)")
 
     uses_empirical_arm_rewards = _uses_empirical_arm_rewards(args.acquisition, args.reward_estimate)
     if (args.method == "adaptive" and args.feedback == "bandit" and args.reward_update == "subsets" and uses_empirical_arm_rewards):
@@ -549,7 +811,7 @@ if __name__ == "__main__":
     if (args.reward_estimate == "empirical" and args.acquisition not in ("greedy", "lp_chain")):
         parser.error(
             "--reward-estimate empirical applies only to "
-            "--acquisition greedy or lp_chain. lp_full and ucb_argmax "
+            "--acquisition greedy or lp_chain. lp_full, ucb_argmax, and hedge "
             "already score arms from the empirical accuracy table "
             "unconditionally, so leave --reward-estimate at its default "
             "('surrogate') there."
@@ -562,46 +824,11 @@ if __name__ == "__main__":
     else:
         max_modalities = None if args.max_modalities.lower() == "all" else int(args.max_modalities)
 
-    t0 = time.time()
-    rows = run_method(
-        args.method, args.dataset, max_modalities, seeds, budget_fractions,
-        args.data_path, args.n_init_fraction_points, args.max_samples,
-        args.n_samples, args.synthetic_seed, args.mean_scale,
-        feedback=args.feedback,
-        synthetic_n_classes=args.num_classes,
-        step_size=args.step_size,
-        lambda_max=args.lambda_max, run_inference=not args.skip_inference,
-        image_pool_side=args.image_pool_side,
-        image_data_home=args.image_cache_dir,
-        pred_rule=args.pred_rule,
-        reward_update=args.reward_update,
-        reward_estimate=args.reward_estimate,
-        alpha_ucb=args.alpha_ucb, lr=args.lr,
-        acquisition=args.acquisition,
-    )
-
-    df = pd.DataFrame(rows, columns=UNIFIED_COLUMNS)
-    print(f"\n{'=' * 70}\nSUMMARY (mean +/- std across seeds"
-          f"{', averaged over init fractions' if args.method in TWO_STAGE_FAMILY else ''}"
-          f") -- {args.method} / {args.dataset}"
-          f" / {args.acquisition}"
-          f"\n{'=' * 70}")
-    print(f"{'Fraction':<10}{'Train Rew':>12}{'Train F1':>10}{'Train AUROC':>13}"
-          f"{'Inf Rew':>10}{'Inf F1':>9}{'Inf AUROC':>11}{'Train Spent':>13}{'Inf Spent':>12}")
-    print("-" * 100)
-    for frac, sub in df.groupby("Budget Fraction"):
-        print(
-            f"{frac:<10.2f}"
-            f"{sub['Train Reward'].mean():>9.3f} "
-            f"{sub['Train F1'].mean():>8.3f} "
-            f"{sub['Train AUROC'].mean():>11.3f} "
-            f"{sub['Inference Reward'].mean():>8.3f} "
-            f"{sub['Inference F1'].mean():>7.3f} "
-            f"{sub['Inference AUROC'].mean():>9.3f} "
-            f"{sub['Train Spent'].mean():>11.4f} "
-            f"{sub['Inference Spent'].mean():>10.4f}"
-        )
-
+    # MOVED ABOVE the sweep. The output path is a pure function of the
+    # arguments, so resolving it first costs nothing and buys two things: an
+    # unwritable --output-xlsx fails in the first second rather than after
+    # ten hours of compute, and the run_id can be derived from its stem so
+    # the log, the manifest, the checkpoint and the workbook share a name.
     if args.output_xlsx:
         output_xlsx = args.output_xlsx
     else:
@@ -610,18 +837,85 @@ if __name__ == "__main__":
         ti_tag = "_trainonly" if args.skip_inference else ""
         fb_tag = f"_{args.feedback}" if args.method == "adaptive" else ""
         acq_tag = f"_{args.acquisition}"
-        if args.acquisition in ("greedy", "lp_chain", "lp_full", "ucb_argmax"):
+        #if args.acquisition in ("greedy", "lp_chain", "lp_full", "ucb_argmax"):
+        if uses_empirical_arm_rewards:
             acq_tag += f"-{args.reward_update}"
         alpha_tag = (f"_alpha{args.alpha_ucb:g}" if (args.alpha_ucb != 2.0 and args.acquisition not in ORACLE_ACQUISITION_MODES) else "")
         reward_estimate_is_live = (args.acquisition in ("greedy", "lp_chain"))
         re_tag = (f"_{args.reward_estimate}" if reward_estimate_is_live else "")
+        dual_tag = f"_step{args.step_size:g}_lmax{args.lambda_max:g}"
+        #uses_omd_dual = (args.acquisition in ("greedy",) + ARGMAX_ACQUISITION_MODES)
+        #dual_tag = (f"_step{args.step_size:g}_lmax{args.lambda_max:g}" if uses_omd_dual else "")
         pr_tag = ("_pairwisevote" if (args.pred_rule == "pairwise_vote" and args.method in TWO_STAGE_FAMILY) else "")
         maxmod_label = "ALL" if max_modalities is None else str(max_modalities)
         classes_tag = ""
         if args.dataset in SYNTHETIC_DATASETS:
             n_classes = args.num_classes if args.dataset in MULTICLASS_SYNTHETIC_DATASETS else 2
             classes_tag = f"_classes{n_classes}"
-        output_xlsx = str(results_dir/ (f"results_{FILENAME_METHOD_LABELS.get(args.method, args.method)}{fb_tag}{acq_tag}{re_tag}{alpha_tag}_{args.dataset}_max{maxmod_label}_seeds{len(seeds)}{ti_tag}{pr_tag}{classes_tag}.xlsx"))
-        
-    save_unified_results_to_excel(rows, output_xlsx)
-    print(f"Execution time: {time.time() - t0:.1f} seconds")
+        output_xlsx = str(results_dir / (f"results_{FILENAME_METHOD_LABELS.get(args.method, args.method)}{fb_tag}{acq_tag}{re_tag}{alpha_tag}{dual_tag}_{args.dataset}_max{maxmod_label}_seeds{len(seeds)}{ti_tag}{pr_tag}{classes_tag}.xlsx"))
+
+    run = setup_run(
+        "run_proposed_methods",
+        args=args, argv=sys.argv,
+        name_hint=Path(output_xlsx).stem,
+        log_dir=args.log_dir,
+        console_level=args.log_level,
+        trace_rounds=args.trace_rounds,
+        timing=not args.no_fine_timers,
+        extra={"resolved_max_modalities": max_modalities,
+               "resolved_seeds": list(seeds),
+               "resolved_budget_fractions": list(budget_fractions),
+               "output_xlsx": output_xlsx},
+    )
+
+    t0 = time.time()
+    try:
+        rows = run_method(
+            args.method, args.dataset, max_modalities, seeds, budget_fractions,
+            args.data_path, args.n_init_fraction_points, args.max_samples,
+            args.n_samples, args.synthetic_seed, args.mean_scale,
+            feedback=args.feedback,
+            synthetic_n_classes=args.num_classes,
+            step_size=args.step_size,
+            lambda_max=args.lambda_max, run_inference=not args.skip_inference,
+            image_pool_side=args.image_pool_side,
+            image_data_home=args.image_cache_dir,
+            pred_rule=args.pred_rule,
+            reward_update=args.reward_update,
+            reward_estimate=args.reward_estimate,
+            alpha_ucb=args.alpha_ucb, lr=args.lr,
+            acquisition=args.acquisition,
+        )
+    except BaseException as exc:                          # noqa: BLE001
+        # Includes the PBS walltime kill and Ctrl-C. The manifest records
+        # how it ended and where the surviving rows are; recover them with
+        #     python run_proposed_methods.py --rebuild-from <run_id>
+        log.exception("run aborted -- recover completed cells with "
+                      "--rebuild-from %s", run.rows_path)
+        run.finalize(status=f"failed: {type(exc).__name__}: {exc}")
+        raise
+
+    df = pd.DataFrame(rows, columns=UNIFIED_COLUMNS)
+    ok = df[df["Status"] == "ok"] if "Status" in df.columns else df
+    log.info("=" * 70)
+    log.info("SUMMARY (mean +/- std across seeds%s) -- %s / %s / %s",
+             ", averaged over init fractions" if args.method in TWO_STAGE_FAMILY else "",
+             args.method, args.dataset, args.acquisition)
+    log.info("=" * 70)
+    log.info("%-10s%12s%10s%13s%10s%9s%11s%13s%12s", 'Fraction', 'Train Rew',
+             'Train F1', 'Train AUROC', 'Inf Rew', 'Inf F1', 'Inf AUROC',
+             'Train Spent', 'Inf Spent')
+    log.info("-" * 100)
+    for frac, sub in ok.groupby("Budget Fraction"):
+        log.info(
+            "%-10.2f%9.3f %8.3f %11.3f %8.3f %7.3f %9.3f %11.4f %10.4f",
+            frac,
+            sub['Train Reward'].mean(), sub['Train F1'].mean(),
+            sub['Train AUROC'].mean(), sub['Inference Reward'].mean(),
+            sub['Inference F1'].mean(), sub['Inference AUROC'].mean(),
+            sub['Train Spent'].mean(), sub['Inference Spent'].mean(),
+        )
+
+    save_unified_results_to_excel(rows, output_xlsx, info_rows=run.info_rows())
+    log.info("Execution time: %.1f seconds", time.time() - t0)
+    run.finalize(status="ok")

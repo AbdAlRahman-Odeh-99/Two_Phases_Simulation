@@ -9,6 +9,13 @@ the bandit copy directly (two_stage_asymmetric.py itself never defined its
 own). Consolidated here instead, since it's a generic openpyxl formatting
 helper with no method-specific logic -- nothing about it is bandit-,
 submodular-, or two_stage-specific.
+
+ADDED: add_run_info_sheet, which writes core.logging_utils' provenance
+manifest into the workbook as a third sheet. It lives here rather than in
+logging_utils so that logging_utils stays free of an openpyxl import (it is
+imported by the algorithm modules, which have no business depending on a
+spreadsheet library), and because it is the same kind of thing as
+_style_sheet: generic openpyxl formatting with no method-specific logic.
 """
 
 from __future__ import annotations
@@ -60,3 +67,79 @@ def _style_sheet(ws):
             width = min(width, 80)
         ws.column_dimensions[get_column_letter(col[0].column)].width = width
     ws.freeze_panes = "A2"
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# Provenance sheet
+# ─────────────────────────────────────────────────────────────────────────
+def add_run_info_sheet(wb, info_rows, sheet_name="Run Info"):
+    """Write (key, value) provenance pairs as a two-column sheet.
+
+    `info_rows` is what RunContext.info_rows() returns: the flattened
+    manifest -- git commit and dirty flag, full argv, resolved arguments,
+    library versions, hostname, PBS job id, timestamps, row and failure
+    counts. The sidecar {run_id}.manifest.json remains the authoritative
+    copy; this sheet exists because these workbooks get opened in Excel and
+    emailed around, and a result whose provenance is one tab away is a
+    result whose provenance actually gets checked.
+
+    Styled deliberately UNLIKE the data sheets: values are left-aligned and
+    not number-formatted, because most of them are strings (a commit hash
+    centred and rendered as 0.0000 helps nobody).
+
+    Existing sheets are untouched. Called with info_rows=None (no active
+    run context) it is a no-op, so a runner used as a library still writes
+    exactly the workbook it always did.
+    """
+    if not info_rows:
+        return None
+    if sheet_name in wb.sheetnames:
+        del wb[sheet_name]
+    ws = wb.create_sheet(sheet_name)
+
+    HEADER_FILL = PatternFill("solid", fgColor="2F5496")
+    HEADER_FONT = Font(bold=True, color="FFFFFF", size=11)
+    KEY_FONT = Font(bold=True)
+    WARN_FONT = Font(bold=True, color="9C0006")
+
+    ws.append(["Field", "Value"])
+    for cell in ws[1]:
+        cell.fill = HEADER_FILL
+        cell.font = HEADER_FONT
+        cell.alignment = Alignment(horizontal="left", vertical="center")
+
+    for key, value in info_rows:
+        ws.append([str(key), "" if value is None else str(value)])
+
+    for row in ws.iter_rows(min_row=2):
+        k_cell, v_cell = row[0], row[1]
+        k_cell.font = KEY_FONT
+        k_cell.alignment = Alignment(horizontal="left", vertical="top")
+        v_cell.alignment = Alignment(horizontal="left", vertical="top", wrap_text=True)
+        # A dirty working tree is the one field here that invalidates
+        # reproducibility, so it is the one field that gets shouted.
+        if str(k_cell.value).endswith("git_dirty") and str(v_cell.value) == "True":
+            v_cell.font = WARN_FONT
+
+    ws.column_dimensions["A"].width = 34
+    ws.column_dimensions["B"].width = 110
+    ws.freeze_panes = "A2"
+    return ws
+
+
+def style_and_save(filename, data_sheets, info_rows=None):
+    """Apply _style_sheet to `data_sheets`, append the Run Info sheet, save.
+
+    Collapses the four-line load_workbook / _style_sheet / _style_sheet /
+    save incantation that every runner repeats verbatim, so adding the
+    provenance sheet took one argument instead of four more copies of it.
+    """
+    from openpyxl import load_workbook
+
+    wb = load_workbook(filename)
+    for name in data_sheets:
+        if name in wb.sheetnames:
+            _style_sheet(wb[name])
+    add_run_info_sheet(wb, info_rows)
+    wb.save(filename)
+    return filename

@@ -43,16 +43,28 @@ gmm_multiclass_submodular.py's ACQUISITION MODES docstring section. Results dict
 SAME per-fraction key set as gmm_submodular_runner.run_experiment (so
 run_proposed_methods._normalize_frac_keyed_results applies unchanged);
 feedback / n_classes are experiment-level settings the caller records.
+
+=== Observability (see core/logging_utils.py) ===
+Same treatment as the two_stage runner: logging instead of print, a
+per-cell `guard` so one failure does not end the sweep, append-as-you-go
+row checkpointing to results/{run_id}.rows.jsonl, a Progress heartbeat with
+an ETA, and the fine timing decomposition alongside the untouched
+train/inference/seed timings.
+
+One structural note specific to THIS runner: its results object is a
+dict-of-lists keyed by budget fraction, and every list must stay the same
+length or the per-seed alignment breaks. So a failed cell appends a full
+row of NaNs rather than being skipped -- CELL_FIELDS below is the single
+list that keeps the success and failure paths in step.
 """
 
 from __future__ import annotations
 
+import sys
 import time
-from pathlib import Path
 
 import numpy as np
 import pandas as pd
-from openpyxl import load_workbook
 
 from core.datasets import (
     ALL_DATASETS,
@@ -69,7 +81,18 @@ from core.datasets import (
     load_dataset_as_numpy,
     split_train_inference,
 )
-from core.excel_utils import _style_sheet, serialize_selected_subsets
+from core.excel_utils import serialize_selected_subsets, style_and_save
+from core.logging_utils import (
+    TIMING_COLUMNS,
+    Progress,
+    cell_timers,
+    get_logger,
+    get_run,
+    guard,
+    setup_run,
+    tick,
+    timing_row,
+)
 from core.lp_colgen import solve_lp_policy_colgen_multiclass
 from core.optimal_static import synthetic_true_means
 
@@ -86,6 +109,58 @@ from gmm_submodular.gmm_multiclass_submodular import (
 from core.submodular_greedy import (
     uses_empirical_arm_rewards as _uses_empirical_arm_rewards,
 )
+
+log = get_logger("afa.adaptive.runner")
+
+
+#: Every per-cell series in the results dict, in one place.
+#:
+#: The success path fills these from the phase results; the failure path
+#: fills them with NaN. Both append EXACTLY these keys, which is what keeps
+#: results[frac]["train_reward"][i] and results[frac]["seed_time_sec"][i]
+#: referring to the same seed after a cell has failed. Adding a metric means
+#: adding it here and nowhere else.
+CELL_FIELDS = (
+    "train_reward", "train_f1", "train_auroc",
+    "inference_reward", "inference_f1", "inference_auroc",
+    "total_reward",
+    "train_spent", "inference_spent", "num_masks_inference",
+    "train_time_sec", "inference_time_sec",
+    "n_train", "n_inference",
+    "train_budget", "inference_budget",
+    "n_arms", "avg_views_train", "selected_subsets",
+    "status", "error_msg",
+) + TIMING_COLUMNS
+
+#: seed_time_sec is appended once per SEED (after its budget-fraction loop),
+#: not once per cell, so it is tracked separately from CELL_FIELDS.
+ALL_FIELDS = CELL_FIELDS + ("seed_time_sec",)
+
+
+def _ok_mask(r):
+    """Boolean mask of the cells that succeeded, for the summary sheet."""
+    status = r.get("status")
+    if not status:
+        return np.ones(len(r["train_reward"]), dtype=bool)
+    return np.array([s == "ok" for s in status], dtype=bool)
+
+
+def _agg(r, key, fn=np.mean):
+    """Aggregate one metric over the SUCCESSFUL cells only.
+
+    Guards the empty case explicitly: np.mean of an empty slice returns NaN
+    with a RuntimeWarning, and a budget fraction where every seed failed is
+    exactly the situation where a stray warning in a 10-hour log is least
+    likely to be noticed. NaN is the right answer; the warning is not.
+    """
+    vals = np.asarray(r.get(key, []), dtype=float)
+    mask = _ok_mask(r)
+    if len(vals) == len(mask):
+        vals = vals[mask]
+    vals = vals[np.isfinite(vals)] if fn in (np.mean, np.std) else vals
+    if vals.size == 0:
+        return float("nan")
+    return float(fn(vals))
 
 
 def run_experiment(
@@ -189,16 +264,19 @@ def run_experiment(
             f"into a plug-in estimate the learning modes can beat, which is worse "
             f"than no ceiling at all. Use acquisition='lp_full' on real data.")
 
-    X_full, Y_full, feature_names = load_dataset_as_numpy(
-        dataset_name, max_modalities=max_modalities, data_path=data_path,
-        max_samples=max_samples, synthetic_n_samples=synthetic_n_samples,
-        synthetic_n_views=synthetic_n_views, synthetic_seed=synthetic_seed,
-        synthetic_mean_scale=synthetic_mean_scale,
-        synthetic_cluster_std=synthetic_cluster_std,
-        synthetic_n_classes=synthetic_n_classes,
-        image_pool_side=image_pool_side,
-        image_data_home=image_data_home,
-    )
+    run = get_run()
+
+    with tick("t_data_load"):
+        X_full, Y_full, feature_names = load_dataset_as_numpy(
+            dataset_name, max_modalities=max_modalities, data_path=data_path,
+            max_samples=max_samples, synthetic_n_samples=synthetic_n_samples,
+            synthetic_n_views=synthetic_n_views, synthetic_seed=synthetic_seed,
+            synthetic_mean_scale=synthetic_mean_scale,
+            synthetic_cluster_std=synthetic_cluster_std,
+            synthetic_n_classes=synthetic_n_classes,
+            image_pool_side=image_pool_side,
+            image_data_home=image_data_home,
+        )
     n_samples, nviews = X_full.shape
     nclasses = int(Y_full.max()) + 1
 
@@ -213,15 +291,14 @@ def run_experiment(
             mean_scale=synthetic_mean_scale,
             n_classes=synthetic_n_classes,
         )
-        print(f"  [oracle] recovered true means for acquisition={acquisition}: "
-              f"shape {true_means.shape}")
+        log.info("[oracle] recovered true means for acquisition=%s: shape %s",
+                 acquisition, true_means.shape)
 
     _has_ru = _uses_empirical_arm_rewards(acquisition, reward_estimate)
     ru_tag = f"/{reward_update}" if _has_ru else ""
-    print(f"{dataset_name}: {n_samples} samples, {nviews} views, "
-          f"{nclasses} classes, feedback={feedback}, "
-          f"acquisition={acquisition}{ru_tag} "
-          f"(free: '{feature_names[0]}', {nviews - 1} paid)")
+    log.info("%s: %d samples, %d views, %d classes, feedback=%s, acquisition=%s%s "
+             "(free: '%s', %d paid)", dataset_name, n_samples, nviews, nclasses,
+             feedback, acquisition, ru_tag, feature_names[0], nviews - 1)
 
     # Fixed per-dataset costs
     raw_feature_costs = np.array(
@@ -230,26 +307,24 @@ def run_experiment(
     )
     costs = raw_feature_costs / raw_feature_costs.sum()
     paid_costs = costs[1:]
-    print(f"feature_costs[0] (free) = {costs[0]}, paid costs (normalized, sum(costs)==1): "
-          f"min={paid_costs.min():.4f}, max={paid_costs.max():.4f}, "
-          f"mean={paid_costs.mean():.4f}, sum={paid_costs.sum():.4f}")
+    log.info("feature_costs[0] (free) = %s, paid costs (normalized, sum(costs)==1): "
+             "min=%.4f, max=%.4f, mean=%.4f, sum=%.4f",
+             costs[0], paid_costs.min(), paid_costs.max(), paid_costs.mean(),
+             paid_costs.sum())
 
-    results = {
-        frac: {"train_reward": [], "train_f1": [], "train_auroc": [],
-               "inference_reward": [], "inference_f1": [], "inference_auroc": [],
-               "total_reward": [],
-               "train_spent": [], "inference_spent": [], "num_masks_inference": [],
-               "train_time_sec": [], "inference_time_sec": [], "seed_time_sec": [],
-               "n_train": [], "n_inference": [],
-               "train_budget": [], "inference_budget": [],
-               "n_arms": [], "avg_views_train": [], "selected_subsets": []}
-        for frac in budget_fractions
-    }
+    results = {frac: {k: [] for k in ALL_FIELDS} for frac in budget_fractions}
+
+    total_cells = len(seeds) * len(budget_fractions)
+    progress = Progress(total_cells, label="cells", logger=log)
+    log.info("sweep: %d seeds x %d budget fractions = %d cells",
+             len(seeds), len(budget_fractions), total_cells)
 
     for seed in seeds:
         seed_start = time.time()
-        print(f"\n{'=' * 60}\n=== SEED {seed} ({dataset_name}, {feedback} feedback, "
-              f"{acquisition} acquisition) ===\n{'=' * 60}")
+        log.info("=" * 60)
+        log.info("=== SEED %s (%s, %s feedback, %s acquisition) ===",
+                 seed, dataset_name, feedback, acquisition)
+        log.info("=" * 60)
 
         train_idx, test_idx = split_train_inference(n_samples, seed=seed)
         X_train, Y_train = X_full[train_idx], Y_full[train_idx]
@@ -272,92 +347,142 @@ def run_experiment(
             train_inference_split = n_train / n_total
             training_budget = train_inference_split * total_budget
             inference_budget = total_budget - training_budget
-            print(f"\nBudget fraction {frac:.2f} -> total_budget={total_budget:.4f} (n_total={n_total})")
-            print(f"  Train pool: {training_budget:.4f} | Inference pool: {inference_budget:.4f}")
+            log.info("Budget fraction %.2f -> total_budget=%.4f (n_total=%d)",
+                     frac, total_budget, n_total)
+            log.info("  Train pool: %.4f | Inference pool: %.4f",
+                     training_budget, inference_budget)
 
-            train_start = time.time()
-            ph1 = run_training_phase(
-                nviews=nviews, nclasses=nclasses, costs=costs, n_train=n_train,
-                training_budget=training_budget, X_train=X_train, Y_train=Y_train,
-                est_means_init=est_means_init, feedback=feedback,
-                alpha_ucb=alpha_ucb, step_size=step_size, lambda_max=lambda_max, lr=lr, rng=rng,
-                acquisition=acquisition, reward_update=reward_update,
-                reward_estimate=reward_estimate,
-                true_means=true_means,
-            )
-            train_time = time.time() - train_start
-            print(f"  [Training] Reward: {ph1['train_reward']:.3f} | F1: {ph1['train_f1']:.3f} "
-                  f"| AUROC: {ph1['train_auroc']:.3f} | Spent: {ph1['spent']:.4f} / {training_budget:.4f} "
-                  f"| Time: {train_time:.2f}s")
-            if acquisition != "greedy" or reward_estimate == "empirical":
-                print(
-                    f"  [Training] Acquisition {acquisition}{ru_tag}, "
-                    f"reward_estimate={reward_estimate}: "
-                    f"{ph1['n_arms']} arms | "
-                    f"avg views/round: {ph1['avg_views_acquired']:.2f} | "
-                    f"distinct masks played: {ph1['n_unique_masks']}"
-                )
-            if run_inference:
-                inference_start = time.time()
-                masks, probs = solve_lp_policy_colgen_multiclass(
-                    est_means=ph1["est_means"], costs=costs,
-                    inference_budget=inference_budget, n_inference=n_inf,
-                )
-                combo_costs = np.array([np.sum(costs[m]) for m in masks])
-                print(f"  [Inference] Column generation discovered {len(masks)} subsets "
-                      f"(power set would have been 2^{nviews}-1 = {2**nviews - 1})")
-                ph2 = run_inference_phase(
-                    masks=masks, probs=probs, combo_costs=combo_costs, costs=costs,
-                    est_means=ph1["est_means"],
-                    inference_budget=inference_budget, X_inf=X_inf, Y_inf=Y_inf, rng=rng,
-                )
-                inference_time = time.time() - inference_start
-                print(f"  [Inference] Reward: {ph2['inference_reward']:.3f} | F1: {ph2['inference_f1']:.3f} "
-                      f"| AUROC: {ph2['inference_auroc']:.3f} | Spent: {ph2['spent']:.4f} / {inference_budget:.4f} "
-                      f"| Time: {inference_time:.2f}s")
+            cell = {"seed": int(seed), "budget_fraction": float(frac)}
+            vals = None
 
-                total_reward = (n_train * ph1["train_reward"] + n_inf * ph2["inference_reward"]) / n_total
-                num_masks = len(masks)
-            else:
-                # --skip-inference
-                ph2 = {
-                    "inference_reward": float("nan"),
-                    "inference_f1": float("nan"),
-                    "inference_auroc": float("nan"),
-                    "spent": 0.0,
+            with cell_timers(inherit=("t_data_load",)) as timers, \
+                    guard(cell, logger=log) as outcome:
+                train_start = time.time()
+                ph1 = run_training_phase(
+                    nviews=nviews, nclasses=nclasses, costs=costs, n_train=n_train,
+                    training_budget=training_budget, X_train=X_train, Y_train=Y_train,
+                    est_means_init=est_means_init, feedback=feedback,
+                    alpha_ucb=alpha_ucb, step_size=step_size, lambda_max=lambda_max, lr=lr, rng=rng,
+                    acquisition=acquisition, reward_update=reward_update,
+                    reward_estimate=reward_estimate,
+                    true_means=true_means,
+                )
+                train_time = time.time() - train_start
+                log.info("  [Training] Reward: %.3f | F1: %.3f | AUROC: %.3f "
+                         "| Spent: %.4f / %.4f | Time: %.2fs",
+                         ph1['train_reward'], ph1['train_f1'], ph1['train_auroc'],
+                         ph1['spent'], training_budget, train_time)
+                if acquisition != "greedy" or reward_estimate == "empirical":
+                    log.info("  [Training] Acquisition %s%s, reward_estimate=%s: %s arms "
+                             "| avg views/round: %.2f | distinct masks played: %s",
+                             acquisition, ru_tag, reward_estimate, ph1['n_arms'],
+                             ph1['avg_views_acquired'], ph1['n_unique_masks'])
+                if run_inference:
+                    inference_start = time.time()
+                    with tick("t_inference_solve"):
+                        masks, probs = solve_lp_policy_colgen_multiclass(
+                            est_means=ph1["est_means"], costs=costs,
+                            inference_budget=inference_budget, n_inference=n_inf,
+                        )
+                    combo_costs = np.array([np.sum(costs[m]) for m in masks])
+                    log.info("  [Inference] Column generation discovered %d subsets "
+                             "(power set would have been 2^%d-1 = %d)",
+                             len(masks), nviews, 2 ** nviews - 1)
+                    with tick("t_inference_sample"):
+                        ph2 = run_inference_phase(
+                            masks=masks, probs=probs, combo_costs=combo_costs, costs=costs,
+                            est_means=ph1["est_means"],
+                            inference_budget=inference_budget, X_inf=X_inf, Y_inf=Y_inf, rng=rng,
+                        )
+                    inference_time = time.time() - inference_start
+                    log.info("  [Inference] Reward: %.3f | F1: %.3f | AUROC: %.3f "
+                             "| Spent: %.4f / %.4f | Time: %.2fs",
+                             ph2['inference_reward'], ph2['inference_f1'],
+                             ph2['inference_auroc'], ph2['spent'], inference_budget,
+                             inference_time)
+
+                    total_reward = (n_train * ph1["train_reward"] + n_inf * ph2["inference_reward"]) / n_total
+                    num_masks = len(masks)
+                else:
+                    # --skip-inference
+                    ph2 = {
+                        "inference_reward": float("nan"),
+                        "inference_f1": float("nan"),
+                        "inference_auroc": float("nan"),
+                        "spent": 0.0,
+                    }
+                    inference_time = 0.0
+                    num_masks = np.nan
+                    total_reward = ph1["train_reward"]
+                    log.info("  [Inference] SKIPPED (--skip-inference); "
+                             "train-only total_reward")
+
+                log.info("  [Total]   Reward: %.3f", total_reward)
+
+                vals = {
+                    "train_reward": ph1["train_reward"],
+                    "train_f1": ph1["train_f1"],
+                    "train_auroc": ph1["train_auroc"],
+                    "inference_reward": ph2["inference_reward"],
+                    "inference_f1": ph2["inference_f1"],
+                    "inference_auroc": ph2["inference_auroc"],
+                    "total_reward": total_reward,
+                    "n_arms": ph1["n_arms"],
+                    "avg_views_train": ph1["avg_views_acquired"],
+                    "selected_subsets": ph1["selected_subsets"],
+                    "train_spent": ph1["spent"],
+                    "inference_spent": ph2["spent"],
+                    "num_masks_inference": num_masks,
+                    "train_time_sec": train_time,
+                    "inference_time_sec": inference_time,
+                    "n_train": n_train,
+                    "n_inference": n_inf,
+                    "train_budget": training_budget,
+                    "inference_budget": inference_budget,
                 }
-                inference_time = 0.0
-                num_masks = np.nan
-                total_reward = ph1["train_reward"]
-                print(f"  [Inference] SKIPPED (--skip-inference); train-only total_reward")
 
-            print(f"  [Total]   Reward: {total_reward:.3f}")
+            if vals is None:
+                # Failed cell: a full-width NaN row, so every list in
+                # results[frac] stays the same length and the i-th entry of
+                # each still belongs to the i-th seed.
+                vals = {k: float("nan") for k in CELL_FIELDS}
+                vals["selected_subsets"] = []
+                vals.update({"n_train": n_train, "n_inference": n_inf,
+                             "train_budget": training_budget,
+                             "inference_budget": inference_budget})
 
-            results[frac]["train_reward"].append(ph1["train_reward"])
-            results[frac]["train_f1"].append(ph1["train_f1"])
-            results[frac]["train_auroc"].append(ph1["train_auroc"])
-            results[frac]["inference_reward"].append(ph2["inference_reward"])
-            results[frac]["inference_f1"].append(ph2["inference_f1"])
-            results[frac]["inference_auroc"].append(ph2["inference_auroc"])
-            results[frac]["total_reward"].append(total_reward)
-            results[frac]["n_arms"].append(ph1["n_arms"])
-            results[frac]["avg_views_train"].append(ph1["avg_views_acquired"])
-            results[frac]["selected_subsets"].append(ph1["selected_subsets"])
-            results[frac]["train_spent"].append(ph1["spent"])
-            results[frac]["inference_spent"].append(ph2["spent"])
-            results[frac]["num_masks_inference"].append(num_masks)
-            results[frac]["train_time_sec"].append(train_time)
-            results[frac]["inference_time_sec"].append(inference_time)
-            results[frac]["n_train"].append(n_train)
-            results[frac]["n_inference"].append(n_inf)
-            results[frac]["train_budget"].append(training_budget)
-            results[frac]["inference_budget"].append(inference_budget)
+            vals["status"] = outcome.status
+            vals["error_msg"] = outcome.error
+            vals.update(timing_row(timers))
+
+            for k in CELL_FIELDS:
+                results[frac][k].append(vals.get(k, float("nan")))
+
+            if run is not None:
+                run.emit_row({**cell, **{k: vals.get(k) for k in CELL_FIELDS
+                                         if k != "selected_subsets"}})
+                if run.trace_rounds:
+                    # This method's algorithm module returns only the played
+                    # subset per round (no per-round lambda/budget state), so
+                    # the trace it can honestly produce is thinner than
+                    # two_stage's -- subsets and their costs, nothing invented.
+                    for i, subset in enumerate(vals.get("selected_subsets") or []):
+                        run.emit_trace({**cell, "round": i, "subset": list(subset),
+                                        "n_views": len(subset)})
+            progress.step(note=f"seed {seed} bf {frac:g}")
 
         seed_elapsed = time.time() - seed_start
-        print(f"\n  [SEED {seed}] wall-clock time: {seed_elapsed:.1f}s "
-              f"({len(budget_fractions)} budget fractions)")
+        log.info("[SEED %s] wall-clock time: %.1fs (%d budget fractions)",
+                 seed, seed_elapsed, len(budget_fractions))
         for frac in budget_fractions:
             results[frac]["seed_time_sec"].append(seed_elapsed)
+
+    n_failed = sum(sum(1 for s in results[f]["status"] if s != "ok")
+                   for f in budget_fractions)
+    if n_failed:
+        log.warning("%d/%d cells FAILED and were recorded with status='error' -- see "
+                    "the log for tracebacks and the manifest for the list",
+                    n_failed, total_cells)
 
     return results
 
@@ -365,11 +490,17 @@ def run_experiment(
 def save_results_to_excel(results, budget_fractions, dataset_name, feedback,
                           seeds=None, filename=None, acquisition="greedy",
                           reward_estimate="surrogate",
-                          reward_update=""):
+                          reward_update="", info_rows=None):
     """Same shape as gmm_submodular_runner.save_results_to_excel, plus
     'Feedback' / 'Acquisition' / 'Reward Update' columns on every row
     (experiment-level settings, constant within one file, recorded per row
-    so files concatenate cleanly)."""
+    so files concatenate cleanly).
+
+    CHANGED, additively: Status / Error and the fine timing block are
+    appended to the Detailed sheet, the Summary sheet aggregates over
+    successful cells only (see _agg), and a "Run Info" sheet carries the
+    provenance manifest when a run context is active.
+    """
     if filename is None:
         filename = f"results_gmm_{feedback}_{acquisition}_{dataset_name}.xlsx"
 
@@ -379,7 +510,7 @@ def save_results_to_excel(results, budget_fractions, dataset_name, feedback,
         n = len(r["train_reward"])
         row_labels = seeds if seeds is not None and len(seeds) == n else range(n)
         for label, i in zip(row_labels, range(n)):
-            detailed_rows.append({
+            row = {
                 "Seed": label,
                 "Feedback": feedback,
                 "Acquisition": acquisition,
@@ -409,62 +540,70 @@ def save_results_to_excel(results, budget_fractions, dataset_name, feedback,
                                     if "avg_views_train" in r else np.nan),
                 "Selected Subsets": serialize_selected_subsets(
                     r["selected_subsets"][i]),
-            })
+                "Status": r["status"][i],
+                "Error": r["error_msg"][i],
+            }
+            for k in TIMING_COLUMNS:
+                row[k] = r[k][i] if k in r else np.nan
+            detailed_rows.append(row)
     df_detailed = pd.DataFrame(detailed_rows)
 
     summary_rows = []
     for frac in budget_fractions:
         r = results[frac]
-        summary_rows.append({
+        n_ok = int(_ok_mask(r).sum())
+        summary = {
             "Budget Fraction": frac,
             "Feedback": feedback,
             "Acquisition": acquisition,
             "Reward Estimate": reward_estimate,
             "Reward Update": reward_update,
-            "Train Reward Mean": np.mean(r["train_reward"]),
-            "Train Reward Std": np.std(r["train_reward"]),
-            "Train F1 Mean": np.nanmean(r["train_f1"]),
-            "Train F1 Std": np.nanstd(r["train_f1"]),
-            "Train AUROC Mean": np.nanmean(r["train_auroc"]),
-            "Train AUROC Std": np.nanstd(r["train_auroc"]),
-            "Inference Reward Mean": np.mean(r["inference_reward"]),
-            "Inference Reward Std": np.std(r["inference_reward"]),
-            "Inference F1 Mean": np.nanmean(r["inference_f1"]),
-            "Inference F1 Std": np.nanstd(r["inference_f1"]),
-            "Inference AUROC Mean": np.nanmean(r["inference_auroc"]),
-            "Inference AUROC Std": np.nanstd(r["inference_auroc"]),
-            "Total Reward Mean": np.mean(r["total_reward"]),
-            "Total Reward Std": np.std(r["total_reward"]),
-            "Total Error Mean": 1 - np.mean(r["total_reward"]),
-            "Train Spent Mean": np.mean(r["train_spent"]),
-            "Inference Spent Mean": np.mean(r["inference_spent"]),
-            "Num Masks Inference Mean": np.mean(r["num_masks_inference"]),
-            "Train Time Mean (s)": np.mean(r["train_time_sec"]),
-            "Inference Time Mean (s)": np.mean(r["inference_time_sec"]),
-            "Seed Time Mean (s)": np.mean(r["seed_time_sec"]),
-            "Train Samples": r["n_train"][0],
-            "Inference Samples": r["n_inference"][0],
-            "Train Budget Mean": np.mean(r["train_budget"]),
-            "Inference Budget Mean": np.mean(r["inference_budget"]),
+            "Seeds OK": n_ok,
+            "Seeds Failed": len(r["train_reward"]) - n_ok,
+            "Train Reward Mean": _agg(r, "train_reward"),
+            "Train Reward Std": _agg(r, "train_reward", np.std),
+            "Train F1 Mean": _agg(r, "train_f1"),
+            "Train F1 Std": _agg(r, "train_f1", np.std),
+            "Train AUROC Mean": _agg(r, "train_auroc"),
+            "Train AUROC Std": _agg(r, "train_auroc", np.std),
+            "Inference Reward Mean": _agg(r, "inference_reward"),
+            "Inference Reward Std": _agg(r, "inference_reward", np.std),
+            "Inference F1 Mean": _agg(r, "inference_f1"),
+            "Inference F1 Std": _agg(r, "inference_f1", np.std),
+            "Inference AUROC Mean": _agg(r, "inference_auroc"),
+            "Inference AUROC Std": _agg(r, "inference_auroc", np.std),
+            "Total Reward Mean": _agg(r, "total_reward"),
+            "Total Reward Std": _agg(r, "total_reward", np.std),
+            "Total Error Mean": 1 - _agg(r, "total_reward"),
+            "Train Spent Mean": _agg(r, "train_spent"),
+            "Inference Spent Mean": _agg(r, "inference_spent"),
+            "Num Masks Inference Mean": _agg(r, "num_masks_inference"),
+            "Train Time Mean (s)": _agg(r, "train_time_sec"),
+            "Inference Time Mean (s)": _agg(r, "inference_time_sec"),
+            "Seed Time Mean (s)": _agg(r, "seed_time_sec"),
+            "Train Samples": r["n_train"][0] if r["n_train"] else np.nan,
+            "Inference Samples": r["n_inference"][0] if r["n_inference"] else np.nan,
+            "Train Budget Mean": _agg(r, "train_budget"),
+            "Inference Budget Mean": _agg(r, "inference_budget"),
             "Num Arms": (r["n_arms"][0] if r.get("n_arms") else np.nan),
-            "Avg Views Train Mean": (np.mean(r["avg_views_train"])
-                                     if r.get("avg_views_train") else np.nan),
-        })
+            "Avg Views Train Mean": _agg(r, "avg_views_train"),
+        }
+        for k in TIMING_COLUMNS:
+            summary[f"{k} Mean"] = _agg(r, k)
+        summary_rows.append(summary)
     df_summary = pd.DataFrame(summary_rows)
 
     with pd.ExcelWriter(filename, engine="openpyxl") as writer:
         df_detailed.to_excel(writer, sheet_name="Detailed Results", index=False)
         df_summary.to_excel(writer, sheet_name="Summary", index=False)
 
-    wb = load_workbook(filename)
-    _style_sheet(wb["Detailed Results"])
-    _style_sheet(wb["Summary"])
-    wb.save(filename)
-    print(f"Results saved to {filename}")
+    style_and_save(filename, ["Detailed Results", "Summary"], info_rows=info_rows)
+    log.info("Results saved to %s", filename)
 
 
 if __name__ == "__main__":
     import argparse
+    from pathlib import Path
 
     parser = argparse.ArgumentParser(
         description="Run the multiclass submodular AFA algorithm (full or bandit feedback) "
@@ -554,58 +693,25 @@ if __name__ == "__main__":
     parser.add_argument("--lambda-max", type=float, default=10.0,
                          help="OMD dual clipping ceiling for greedy and ucb_argmax.",)
     parser.add_argument("--output-xlsx", type=str, default=None)
+    # ── observability flags (see core/logging_utils.py) ──
+    parser.add_argument("--log-level", default="INFO",
+                        choices=("DEBUG", "INFO", "WARNING", "ERROR"),
+                        help="CONSOLE verbosity; the file log always keeps DEBUG.")
+    parser.add_argument("--log-dir", default="logs")
+    parser.add_argument("--trace-rounds", action="store_true",
+                        help="Write one record per training round to "
+                             "results/{run_id}.trace.jsonl.")
+    parser.add_argument("--no-fine-timers", action="store_true",
+                        help="Disable the fine-grained timing buckets (t_* columns "
+                             "become NaN). train/inference/seed timings are unaffected.")
     args = parser.parse_args()
 
     budget_fractions = tuple(float(x) for x in args.budget_fractions.split(","))
     seeds = tuple(int(x) for x in args.seeds.split(","))
     max_modalities = None if args.max_modalities.lower() == "all" else int(args.max_modalities)
 
-    t0 = time.time()
-    results = run_experiment(
-        args.dataset,
-        feedback=args.feedback,
-        acquisition=args.acquisition,
-        reward_estimate=args.reward_estimate,
-        reward_update=args.reward_update,
-        max_modalities=max_modalities,
-        seeds=seeds,
-        budget_fractions=budget_fractions,
-        data_path=args.data_path,
-        max_samples=args.max_samples,
-        synthetic_n_samples=args.n_samples,
-        synthetic_n_views=args.n_views,
-        synthetic_seed=args.synthetic_seed,
-        synthetic_mean_scale=args.mean_scale,
-        synthetic_n_classes=args.num_classes,
-        alpha_ucb=args.alpha_ucb,
-        lr=args.lr,
-        step_size=args.step_size,
-        lambda_max=args.lambda_max,
-        run_inference=not args.skip_inference,
-        image_pool_side=args.image_pool_side,
-        image_data_home=args.image_cache_dir,
-    )
-
     _cli_has_ru = _uses_empirical_arm_rewards(args.acquisition, args.reward_estimate)
     acq_label = args.acquisition + (f"/{args.reward_update}" if _cli_has_ru else "")
-    print(f"\n{'=' * 70}\nSUMMARY (mean +/- std across seeds) -- {args.dataset} / "
-          f"{args.feedback} / {acq_label}\n{'=' * 70}")
-    print(f"{'Fraction':<10}{'Train Reward':>16}{'Train F1':>12}{'Train AUROC':>14}"
-          f"{'Inf Reward':>14}{'Inf F1':>10}{'Inf AUROC':>12}{'Total Reward':>16}{'Total Error':>14}")
-    print("-" * 130)
-    for frac in budget_fractions:
-        r = results[frac]
-        print(
-            f"{frac:<10.1f}"
-            f"{np.mean(r['train_reward']):>11.3f}+/-{np.std(r['train_reward']):.3f}"
-            f"{np.nanmean(r['train_f1']):>7.3f}"
-            f"{np.nanmean(r['train_auroc']):>14.3f}"
-            f"{np.mean(r['inference_reward']):>9.3f}"
-            f"{np.nanmean(r['inference_f1']):>10.3f}"
-            f"{np.nanmean(r['inference_auroc']):>12.3f}"
-            f"{np.mean(r['total_reward']):>11.3f}+/-{np.std(r['total_reward']):.3f}"
-            f"{1 - np.mean(r['total_reward']):>10.3f}"
-        )
 
     ti_tag = "_trainonly" if args.skip_inference else ""
     # max_modalities is None when --max-modalities all was passed (no
@@ -634,15 +740,86 @@ if __name__ == "__main__":
     reward_estimate_is_live = (args.acquisition in ("greedy", "lp_chain"))
     re_tag = (f"_{args.reward_estimate}" if reward_estimate_is_live else "")
     dual_tag = f"_step{args.step_size:g}_lmax{args.lambda_max:g}"
-    
+
+    # Computed BEFORE the run -- see the equivalent note in
+    # two_stage_multiclass_greedy_runner.py.
     output_xlsx = args.output_xlsx or (
         f"results_adaptive_{args.feedback}{acq_tag}{re_tag}{dual_tag}_"
         f"{args.dataset}_max{maxmod_label}_seeds{len(seeds)}"
         f"{ti_tag}{classes_tag}.xlsx"
     )
+
+    run = setup_run(
+        "gmm_multiclass_submodular_runner",
+        args=args, argv=sys.argv,
+        name_hint=Path(output_xlsx).stem,
+        log_dir=args.log_dir,
+        console_level=args.log_level,
+        trace_rounds=args.trace_rounds,
+        timing=not args.no_fine_timers,
+        extra={"resolved_max_modalities": max_modalities,
+               "resolved_seeds": list(seeds),
+               "resolved_budget_fractions": list(budget_fractions),
+               "output_xlsx": output_xlsx},
+    )
+
+    t0 = time.time()
+    try:
+        results = run_experiment(
+            args.dataset,
+            feedback=args.feedback,
+            acquisition=args.acquisition,
+            reward_estimate=args.reward_estimate,
+            reward_update=args.reward_update,
+            max_modalities=max_modalities,
+            seeds=seeds,
+            budget_fractions=budget_fractions,
+            data_path=args.data_path,
+            max_samples=args.max_samples,
+            synthetic_n_samples=args.n_samples,
+            synthetic_n_views=args.n_views,
+            synthetic_seed=args.synthetic_seed,
+            synthetic_mean_scale=args.mean_scale,
+            synthetic_n_classes=args.num_classes,
+            alpha_ucb=args.alpha_ucb,
+            lr=args.lr,
+            step_size=args.step_size,
+            lambda_max=args.lambda_max,
+            run_inference=not args.skip_inference,
+            image_pool_side=args.image_pool_side,
+            image_data_home=args.image_cache_dir,
+        )
+    except BaseException as exc:                          # noqa: BLE001
+        log.exception("run aborted; rows completed so far are in %s", run.rows_path)
+        run.finalize(status=f"failed: {type(exc).__name__}: {exc}")
+        raise
+
+    log.info("=" * 70)
+    log.info("SUMMARY (mean +/- std across seeds) -- %s / %s / %s",
+             args.dataset, args.feedback, acq_label)
+    log.info("=" * 70)
+    log.info("%-10s%16s%12s%14s%14s%10s%12s%16s%14s", 'Fraction', 'Train Reward',
+             'Train F1', 'Train AUROC', 'Inf Reward', 'Inf F1', 'Inf AUROC',
+             'Total Reward', 'Total Error')
+    log.info("-" * 130)
+    for frac in budget_fractions:
+        r = results[frac]
+        log.info(
+            "%-10.1f%11.3f+/-%.3f%7.3f%14.3f%9.3f%10.3f%12.3f%11.3f+/-%.3f%10.3f",
+            frac,
+            _agg(r, 'train_reward'), _agg(r, 'train_reward', np.std),
+            _agg(r, 'train_f1'), _agg(r, 'train_auroc'),
+            _agg(r, 'inference_reward'), _agg(r, 'inference_f1'),
+            _agg(r, 'inference_auroc'),
+            _agg(r, 'total_reward'), _agg(r, 'total_reward', np.std),
+            1 - _agg(r, 'total_reward'),
+        )
+
     save_results_to_excel(results, budget_fractions, args.dataset, args.feedback,
                           seeds=seeds, filename=output_xlsx,
                           acquisition=args.acquisition,
                           reward_estimate=args.reward_estimate,
-                          reward_update=(args.reward_update if _cli_has_ru else ""))
-    print(f"Execution time: {time.time() - t0:.1f} seconds")
+                          reward_update=(args.reward_update if _cli_has_ru else ""),
+                          info_rows=run.info_rows())
+    log.info("Execution time: %.1f seconds", time.time() - t0)
+    run.finalize(status="ok")

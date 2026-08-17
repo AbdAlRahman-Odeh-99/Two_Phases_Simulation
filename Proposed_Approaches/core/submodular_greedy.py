@@ -7,6 +7,19 @@ oracle and the pairwise-Bhattacharyya risk it maximizes. Previously these
 three functions lived inside gmm_submodular/gmm_multiclass_submodular.py;
 they were MOVED here (not duplicated) the moment a second method family --
 two_stage/two_stage_multiclass_greedy.py -- needed the same oracle.
+
+=== Instrumentation note ===
+The five acquisition entry points below carry a
+@timed("t_acquisition") decorator from core.logging_utils. That single
+placement is why the new t_acquisition column is populated for BOTH method
+families and for EVERY acquisition mode without either method module being
+edited: both of them reach their per-round subset choice through exactly
+these functions. Decorators, not `with` blocks, so no numerical body was
+re-indented. The decorator is a no-op when timing is disabled and when no
+runner is collecting, so importing this module standalone costs nothing.
+Do NOT add a t_acquisition tick at any CALLER of these -- ticks accumulate
+per name, and a caller-side tick around a call to a decorated function
+would count the same span twice.
 """
 
 from __future__ import annotations
@@ -14,6 +27,8 @@ from __future__ import annotations
 import numba
 import numpy as np
 import scipy.optimize as opt
+
+from core.logging_utils import bump, timed
 
 ACQUISITION_MODES = ("greedy", "lp_chain", "lp_full", "lp_full_opt", "ucb_argmax", "hedge")
 LP_ACQUISITION_MODES = ("lp_chain", "lp_full", "lp_full_opt")
@@ -85,6 +100,7 @@ def pairwise_diff_sq_from_means(est_means):
 
 
 # Subset selection
+@timed("t_acquisition")
 def greedy_oracle(diff_mean_sq, costs, omd_lambda, remain_budget,
                   free_indices, force_free=True,
                   gain_func=None, empty_value=0.0):
@@ -179,6 +195,7 @@ def greedy_oracle(diff_mean_sq, costs, omd_lambda, remain_budget,
 # ─────────────────────────────────────────────────────────────────────────
 # Enumerated action spaces + the per-round LP over reward estimates.
 # ─────────────────────────────────────────────────────────────────────────
+@timed("t_acquisition")
 def greedy_chain(centers, costs, free_indices, force_free=True,
                  gain_func=None, empty_value=0.0):
     """The GREEDY CHAIN: the nested action space that replaces the
@@ -223,6 +240,7 @@ def greedy_chain(centers, costs, free_indices, force_free=True,
     chain.sort(key=len)
     return [tuple(v + 1 for v in s) for s in chain]              # 1-indexed
 
+@timed("t_acquisition")
 def lp_policy_over_estimates(ucb, combo_cost, cost_order, budget_per_round):
     """Exact optimum of the per-round budgeted LP over the ENUMERATED
     combinations:
@@ -245,6 +263,7 @@ def lp_policy_over_estimates(ucb, combo_cost, cost_order, budget_per_round):
         i.e. exactly what the OMD dual was approximating, so callers report
         it as lambda / omd_lambda and keep Lagrangian traces comparable.
     """
+    bump("n_lp_solves")
     cs, us = combo_cost[cost_order], ucb[cost_order]
     # collapse duplicate costs to their best ucb, keeping the hull well posed
     pts, i, n = [], 0, len(cs)
@@ -286,6 +305,7 @@ def lp_policy_over_estimates(ucb, combo_cost, cost_order, budget_per_round):
     lam = 0.0 if span <= 0 else (y2 - y1) / span
     return i1, i2, float(min(max(p_hi, 0.0), 1.0)), float(max(lam, 0.0))
 
+@timed("t_acquisition")
 def linprog_policy_over_estimates(ucb, combo_cost, budget_per_round):
     """Exact optimum of the per-round budgeted LP over the ENUMERATED
     combinations, solved with a general LP solver:
@@ -306,6 +326,7 @@ def linprog_policy_over_estimates(ucb, combo_cost, budget_per_round):
              what the OMD dual was approximating -- so Lagrangian traces
              stay comparable across acquisition modes.
     """
+    bump("n_lp_solves")
     ucb = np.asarray(ucb, dtype=np.float64).ravel()
     combo_cost = np.asarray(combo_cost, dtype=np.float64).ravel()
     n = ucb.shape[0]
@@ -325,6 +346,16 @@ def linprog_policy_over_estimates(ucb, combo_cost, budget_per_round):
         # Unreachable under this codebase's cost convention (the free-view
         # arm has cost 0, so p = e_free is feasible at any b >= 0), but fall
         # back to the cheapest arm explicitly rather than returning garbage.
+        #
+        # LOGGED, not silent: this branch used to be reachable only in
+        # theory, and if it ever does fire the run keeps going with a
+        # degenerate policy that looks like a legitimate result. A WARNING
+        # is the difference between noticing that and not.
+        from core.logging_utils import get_logger
+        get_logger("afa.acquisition").warning(
+            "linprog FAILED (status=%s, %s) at budget_per_round=%.6g over %d arms; "
+            "falling back to the cheapest arm for this round",
+            getattr(res, "status", "?"), getattr(res, "message", ""), b, n)
         p = np.zeros(n)
         p[int(np.argmin(combo_cost))] = 1.0
         return p, 0.0
@@ -347,6 +378,7 @@ def linprog_policy_over_estimates(ucb, combo_cost, budget_per_round):
 
     return p, max(lam, 0.0)
 
+@timed("t_acquisition")
 def argmax_policy_over_estimates(ucb, combo_cost, omd_lambda,
                                  remain_budget=None):
     """The NOTEBOOK's acquisition rule (acquisition="ucb_argmax"): pick the

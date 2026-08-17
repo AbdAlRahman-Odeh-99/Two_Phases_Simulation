@@ -42,6 +42,18 @@ between independent method families rather than cross-import" convention.
 That convention is only broken where a SHARED implementation is what makes
 a comparison valid (core/submodular_greedy.py's oracle and greedy chain);
 these two are not in that category, so the duplicate stands.
+
+=== Instrumentation note ===
+Three additions, none of which touch a number:
+  * initialize_centers_multiclass carries @timed("t_init_centers"), so
+    Stage 1 is separated from Stage 2 inside what used to be one
+    train_time_sec;
+  * the inference routine times its colgen solve (t_inference_solve) apart
+    from its physical sampling loop (t_inference_sample) -- the solve is
+    one call whose cost scales with nviews, the loop is n_test rounds whose
+    cost scales with the test set, and lumping them hid which was which;
+  * a NaN AUROC and an exhausted inference budget are now logged instead of
+    silently producing a NaN cell and a depressed accuracy.
 """
 
 from __future__ import annotations
@@ -49,12 +61,15 @@ from __future__ import annotations
 import numpy as np
 from sklearn.metrics import f1_score, roc_auc_score
 
+from core.logging_utils import get_logger, tick, timed
 from core.lp_colgen import (
     multiclass_reward,
     pairwise_diff_sq_from_means,
     solve_lp_policy_colgen_multiclass,
 )
 from core.two_stage_utils import match_cluster_labels
+
+_log = get_logger("afa.multiclass")
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -73,13 +88,21 @@ def _macro_ovr_auroc(y_true, score_mat, nclasses):
     """score_mat: (n, nclasses) posterior-score matrix, columns indexed by
     TRUE label (i.e. already passed through any label_map). Falls back to
     NaN if a class is missing from y_true (roc_auc_score raises
-    ValueError in that case)."""
+    ValueError in that case).
+
+    The ValueError is now LOGGED. A NaN AUROC cell has two very different
+    causes -- a class genuinely absent from this split, or a scoring bug --
+    and the workbook cannot tell them apart; the log can.
+    """
     try:
         if nclasses == 2:
             return roc_auc_score(y_true, score_mat[:, 1])
         return roc_auc_score(y_true, score_mat, multi_class="ovr",
                               average="macro", labels=np.arange(nclasses))
-    except ValueError:
+    except ValueError as exc:
+        present = np.unique(np.asarray(y_true))
+        _log.warning("AUROC unavailable (-> NaN): %s | nclasses=%d, classes present "
+                     "in this split: %s", exc, nclasses, present.tolist())
         return float("nan")
 
 
@@ -90,6 +113,7 @@ def _macro_ovr_auroc(y_true, score_mat, nclasses):
 # was already written generically over k_clusters everywhere except the
 # one rng.normal call).
 # ─────────────────────────────────────────────────────────────────────────
+@timed("t_init_centers")
 def initialize_centers_multiclass(x, y, n_init_samples, k_clusters, m_modalities, rng,
                                    pred_rule="nearest_center"):
     """K-class counterpart of two_stage_asymmetric.initialize_centers.
@@ -172,6 +196,18 @@ def initialize_centers_multiclass(x, y, n_init_samples, k_clusters, m_modalities
     #         mistakes += 1
 
     init_error = mistakes / predictions if predictions > 0 else 0.0
+
+    # A class that never appears in the first n_init_samples keeps its
+    # random N(0,1) centre into Stage 2, where it is then never updated
+    # (two_stage freezes the centres). That is a silently crippled run --
+    # visible in the numbers only as an unexplained accuracy floor.
+    if n_init_samples > 0:
+        unseen = np.flatnonzero(counts[:k_clusters] <= 1)
+        if unseen.size:
+            _log.warning("Stage 1 saw NO samples for %d/%d classes %s in its first "
+                         "%d rows -- their centres are still the random N(0,1) draw",
+                         unseen.size, k_clusters, unseen.tolist(), n_init_samples)
+
     return learned_centers, init_error
 
 
@@ -332,17 +368,18 @@ def run_stage2_lp_inference_multiclass(
     -------
     dict with keys: masks, probabilities, inference_accuracy,
     inference_error, inference_f1, inference_auroc, actual_cost,
-    num_masks_inference.
+    num_masks_inference, n_budget_fallbacks.
     """
     n = len(X_inference)
     nclasses = learned_centers.shape[0]
     if label_map is None:
         label_map = {k: k for k in range(nclasses)}
 
-    masks, probs = solve_lp_policy_colgen_multiclass(
-        est_means=learned_centers, costs=costs,
-        inference_budget=inference_budget, n_inference=n,
-    )
+    with tick("t_inference_solve"):
+        masks, probs = solve_lp_policy_colgen_multiclass(
+            est_means=learned_centers, costs=costs,
+            inference_budget=inference_budget, n_inference=n,
+        )
     combo_costs = np.array([float(np.sum(costs[m])) for m in masks])
     probs = np.clip(probs, 0, 1)
     probs = probs / probs.sum() if probs.sum() > 0 else np.ones(len(masks)) / len(masks)
@@ -362,28 +399,41 @@ def run_stage2_lp_inference_multiclass(
     y_pred = np.zeros(n, dtype=int)
     score_mat = np.zeros((n, nclasses))  # columns indexed by RAW cluster index for now
     correct = 0
+    n_fallbacks = 0
 
-    for i in range(n):
-        sel = rng.choice(idxs, p=probs)
-        subset = masks[sel]
-        cost = combo_costs[sel]
+    with tick("t_inference_sample"):
+        for i in range(n):
+            sel = rng.choice(idxs, p=probs)
+            subset = masks[sel]
+            cost = combo_costs[sel]
 
-        if remaining_budget - cost < 0:
-            subset = fallback_subset
-            cost = fallback_cost
-        
-        remaining_budget -= cost
-        actual_cost += cost
+            if remaining_budget - cost < 0:
+                subset = fallback_subset
+                cost = fallback_cost
+                n_fallbacks += 1
 
-        combo = tuple(j + 1 for j, flag in enumerate(subset) if flag)
-        raw_pred, score = predict_single_combination_multiclass(
-            X_inference[i], learned_centers, combo, return_score=True,
-            pred_rule=pred_rule,
-        )
-        matched_pred = label_map.get(raw_pred, raw_pred)
-        y_pred[i] = matched_pred
-        score_mat[i] = score
-        correct += int(matched_pred == Y_inference[i])
+            remaining_budget -= cost
+            actual_cost += cost
+
+            combo = tuple(j + 1 for j, flag in enumerate(subset) if flag)
+            raw_pred, score = predict_single_combination_multiclass(
+                X_inference[i], learned_centers, combo, return_score=True,
+                pred_rule=pred_rule,
+            )
+            matched_pred = label_map.get(raw_pred, raw_pred)
+            y_pred[i] = matched_pred
+            score_mat[i] = score
+            correct += int(matched_pred == Y_inference[i])
+
+    if n_fallbacks:
+        # Not an error -- the policy is budget-feasible only in expectation,
+        # so a run of expensive draws can exhaust it early. But it means the
+        # tail of the test set was classified on the cheapest view alone,
+        # which is a real and otherwise-unrecorded reason for a low
+        # inference_accuracy at a budget fraction that looks generous.
+        _log.info("inference budget exhausted on %d/%d rounds (%.1f%%) -- those "
+                  "rounds fell back to the cheapest view alone", n_fallbacks, n,
+                  100.0 * n_fallbacks / max(1, n))
 
     # Permute score-matrix columns from raw-cluster-index order to
     # true-label order (identity in the real-data case, so this is a
@@ -399,6 +449,10 @@ def run_stage2_lp_inference_multiclass(
     inference_f1 = _macro_f1(Y_inference, y_pred)
     inference_auroc = _macro_ovr_auroc(np.asarray(Y_inference), score_mat, nclasses)
 
+    _log.debug("inference: %d masks, accuracy=%.4f, spent=%.4f/%.4f, fallbacks=%d",
+               len(masks), inference_accuracy, actual_cost, inference_budget,
+               n_fallbacks)
+
     return {
         "masks": masks,
         "probabilities": probs,
@@ -408,6 +462,7 @@ def run_stage2_lp_inference_multiclass(
         "inference_auroc": inference_auroc,
         "actual_cost": actual_cost,
         "num_masks_inference": len(masks),
+        "n_budget_fallbacks": n_fallbacks,
     }
 
 
