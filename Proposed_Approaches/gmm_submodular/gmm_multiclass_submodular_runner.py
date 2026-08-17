@@ -107,6 +107,8 @@ def run_experiment(
     synthetic_n_classes=SYNTHETIC_N_CLASSES,
     alpha_ucb=2.0,
     lr=1e-2,
+    step_size=1.0,
+    lambda_max=10.0,
     run_inference=True,
     image_pool_side=DEFAULT_IMAGE_POOL_SIDE,
     image_data_home=None,
@@ -278,7 +280,7 @@ def run_experiment(
                 nviews=nviews, nclasses=nclasses, costs=costs, n_train=n_train,
                 training_budget=training_budget, X_train=X_train, Y_train=Y_train,
                 est_means_init=est_means_init, feedback=feedback,
-                alpha_ucb=alpha_ucb, lr=lr, rng=rng,
+                alpha_ucb=alpha_ucb, step_size=step_size, lambda_max=lambda_max, lr=lr, rng=rng,
                 acquisition=acquisition, reward_update=reward_update,
                 reward_estimate=reward_estimate,
                 true_means=true_means,
@@ -547,6 +549,10 @@ if __name__ == "__main__":
                               "which exceeds $HOME's quota on clusters like NCI Gadi. Point this "
                               "at your project/scratch space if the default location itself lacks "
                               "quota. Ignored for non-image datasets.")
+    parser.add_argument("--step-size", type=float, default=1.0,
+                         help="OMD dual ascent step size for greedy and ucb_argmax.",)
+    parser.add_argument("--lambda-max", type=float, default=10.0,
+                         help="OMD dual clipping ceiling for greedy and ucb_argmax.",)
     parser.add_argument("--output-xlsx", type=str, default=None)
     args = parser.parse_args()
 
@@ -573,6 +579,8 @@ if __name__ == "__main__":
         synthetic_n_classes=args.num_classes,
         alpha_ucb=args.alpha_ucb,
         lr=args.lr,
+        step_size=args.step_size,
+        lambda_max=args.lambda_max,
         run_inference=not args.skip_inference,
         image_pool_side=args.image_pool_side,
         image_data_home=args.image_cache_dir,
@@ -625,8 +633,10 @@ if __name__ == "__main__":
 
     reward_estimate_is_live = (args.acquisition in ("greedy", "lp_chain"))
     re_tag = (f"_{args.reward_estimate}" if reward_estimate_is_live else "")
+    dual_tag = f"_step{args.step_size:g}_lmax{args.lambda_max:g}"
+    
     output_xlsx = args.output_xlsx or (
-        f"results_adaptive_{args.feedback}{acq_tag}{re_tag}_"
+        f"results_adaptive_{args.feedback}{acq_tag}{re_tag}{dual_tag}_"
         f"{args.dataset}_max{maxmod_label}_seeds{len(seeds)}"
         f"{ti_tag}{classes_tag}.xlsx"
     )
