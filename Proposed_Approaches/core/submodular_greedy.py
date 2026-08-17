@@ -15,22 +15,12 @@ import numba
 import numpy as np
 import scipy.optimize as opt
 
-ACQUISITION_MODES = ("greedy", "lp_chain", "lp_full", "lp_full_opt", "ucb_argmax")
+ACQUISITION_MODES = ("greedy", "lp_chain", "lp_full", "lp_full_opt", "ucb_argmax", "hedge")
 LP_ACQUISITION_MODES = ("lp_chain", "lp_full", "lp_full_opt")
 ORACLE_ACQUISITION_MODES = ("lp_full_opt",)
-# "ucb_argmax": the NOTEBOOK rule (multiclass_supervised_unbiased_adaptive).
-# Full 2^(nviews-1) arm table like lp_full, empirical accuracy estimates like
-# lp_full, but the per-round policy is a DETERMINISTIC Lagrangian argmax
-# rather than an LP over a distribution:
-#     argmax_S  r_hat[S] - lambda_t * cost(S) + bonus[S]
-# and lambda_t is the OMD dual, as under "greedy". So it sits exactly between
-# the two existing families: lp_full's action space and reward table with
-# greedy's dual and greedy's single-arm (no randomisation) commitment.
 ARGMAX_ACQUISITION_MODES = ("ucb_argmax",)
-# Modes that enumerate the FULL powerset eagerly and are therefore capped at
-# MAX_REWARD_ESTIMATE_VIEWS. (lp_chain enumerates only nviews+1 arms unless
-# reward_estimate="empirical", which is capped separately at its own site.)
-FULL_ENUMERATION_MODES = ("lp_full", "lp_full_opt", "ucb_argmax")
+HEDGE_ACQUISITION_MODES = ("hedge",)
+FULL_ENUMERATION_MODES = ("lp_full", "lp_full_opt", "ucb_argmax", "hedge")
 REWARD_UPDATE_SCOPES = ("subsets", "selected")
 MAX_REWARD_ESTIMATE_VIEWS = 20
 
@@ -73,28 +63,7 @@ def validate_reward_estimate(reward_estimate):
 
 
 def uses_empirical_arm_rewards(acquisition, reward_estimate="surrogate"):
-    """Does this (acquisition, reward_estimate) pair maintain the learned
-    per-arm accuracy table -- i.e. is --reward-update live for it?
-
-    Single definition of a predicate that used to be spelled out inline,
-    identically, at eight call sites across both method families, the two
-    runners and run_proposed_methods. Adding "ucb_argmax" in one place is
-    the whole reason this exists; the previous copies would each have had to
-    grow the same third string.
-
-    False for surrogate greedy (the Bhattacharyya proxy needs no data) and
-    for lp_full_opt (its arm values are exact and never scored).
-
-    NOTE the two "empirical"s here are different things and both are
-    correct: the FUNCTION name is about the acquisition consuming a measured
-    table at all, which lp_chain / lp_full / ucb_argmax do regardless of
-    reward_estimate; the ARGUMENT value is about greedy specifically, which
-    is the one mode that can be pointed at either the surrogate or the
-    measured table.
-    """
-    return (acquisition in ("lp_chain", "lp_full", "ucb_argmax")
-            or (acquisition == "greedy"
-                and reward_estimate == "empirical"))
+    return (acquisition in ("lp_chain", "lp_full", "ucb_argmax", "hedge") or (acquisition == "greedy" and reward_estimate == "empirical"))
 
 # Reward
 @numba.njit
