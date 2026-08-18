@@ -119,6 +119,7 @@ def run_experiment(
     acquisition="greedy",
     reward_estimate="surrogate",
     reward_update="subsets",
+    arm_elimination=False,
     alpha_ucb=2.0,
     step_size=1.0,
     lambda_max=10.0,
@@ -281,6 +282,7 @@ def run_experiment(
                         T1=n_init_samples, training_budget=training_budget, rng=rng,
                         acquisition=acquisition, reward_update=reward_update,
                         reward_estimate=reward_estimate,
+                        arm_elimination=arm_elimination,
                         true_means=true_means,
                         alpha_ucb=alpha_ucb,
                         step_size=step_size, lambda_max=lambda_max,
@@ -367,6 +369,11 @@ def run_experiment(
                         'total_reward': total_reward,
                         'train_f1': stage2_result['train_f1'],
                         'train_auroc': stage2_result['train_auroc'],
+                        'arm_elimination': stage2_result['arm_elimination'],
+                        'initial_arms': stage2_result['initial_arms'],
+                        'final_active_arms': stage2_result['final_active_arms'],
+                        'num_eliminated': stage2_result['num_eliminated'],
+                        'elimination_trace': str(stage2_result['elimination_trace']),
                         'init_error': init_error,
                         'two_stage_error': two_stage_error,
                         'inference_length': n_test,
@@ -378,8 +385,8 @@ def run_experiment(
                         'inference_actual_cost': inference_result['actual_cost'],
                         'num_masks_inference': inference_result['num_masks_inference'],
                         'n_budget_fallbacks_train': stage2_result.get('n_budget_fallbacks', np.nan),
-                        'n_budget_fallbacks_inference': inference_result.get(
-                            'n_budget_fallbacks', np.nan),
+                        'n_budget_fallbacks_inference': inference_result.get('n_budget_fallbacks', np.nan),
+
                     }
 
                     if trace_rounds and run is not None and stage2_result.get('round_trace'):

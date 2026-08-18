@@ -202,8 +202,12 @@ def _normalize_frac_keyed_results(results, budget_fractions, seeds, dataset_name
                 "Train Budget": r["train_budget"][i],
                 "Inference Budget": r["inference_budget"][i],
                 "Num Arms": r["n_arms"][i] if "n_arms" in r else np.nan,
-                "Selected Subsets": serialize_selected_subsets(
-                    r["selected_subsets"][i]),
+                "Arm Elimination": (r["arm_elimination"][i] if "arm_elimination" in r else False),
+                "Initial Arms": (r["initial_arms"][i] if "initial_arms" in r else np.nan),
+                "Final Active Arms": (r["final_active_arms"][i] if "final_active_arms" in r else np.nan),
+                "Num Eliminated": (r["num_eliminated"][i] if "num_eliminated" in r else np.nan),
+                "Elimination Trace": (str(r["elimination_trace"][i]) if "elimination_trace" in r else ""),
+                "Selected Subsets": serialize_selected_subsets(r["selected_subsets"][i]),
                 "Status": (r["status"][i] if "status" in r else "ok"),
                 "Error": (r["error_msg"][i] if "error_msg" in r else ""),
             }
@@ -266,10 +270,12 @@ the same "greedy" / "lp_chain+subsets" / "lp_full+selected" strings
             "Train Budget": _nan(d, "training_budget"),
             "Inference Budget": _nan(d, "inference_budget"),
             "Num Arms": _nan(d, "n_arms"),
-            "Selected Subsets": d.get(
-                "Selected Subsets",
-                serialize_selected_subsets(d.get("selected_subsets", [])),
-            ),
+            "Arm Elimination": d.get("arm_elimination", False),
+            "Initial Arms": _nan(d, "initial_arms"),
+            "Final Active Arms": _nan(d, "final_active_arms"),
+            "Num Eliminated": _nan(d, "num_eliminated"),
+            "Elimination Trace": d.get("elimination_trace", ""),
+            "Selected Subsets": d.get("Selected Subsets", serialize_selected_subsets(d.get("selected_subsets", [])),),
             "Status": d.get("status", "ok"),
             "Error": d.get("error_msg", ""),
         }
@@ -326,6 +332,11 @@ def normalize_adaptive_flat_rows(rows, dataset_name, feedback=np.nan, n_classes=
             "Train Budget": _nan(d, "train_budget"),
             "Inference Budget": _nan(d, "inference_budget"),
             "Num Arms": _nan(d, "n_arms"),
+            "Arm Elimination": d.get("arm_elimination", False),
+            "Initial Arms": _nan(d, "initial_arms"),
+            "Final Active Arms": _nan(d, "final_active_arms"),
+            "Num Eliminated": _nan(d, "num_eliminated"),
+            "Elimination Trace": str(d.get("elimination_trace", "")),
             "Selected Subsets": "",   # not checkpointed -- see emit_row
             "Status": d.get("status", "ok"),
             "Error": d.get("error_msg", ""),
@@ -351,14 +362,15 @@ UNIFIED_COLUMNS = [
     "Train Time (s)", "Inference Time (s)", "Seed Time (s)",
     "Num Masks Inference",
     "Acquisition", "Reward Estimate", "Num Arms",
-    "Alpha UCB",
+    "Arm Elimination", "Initial Arms", "Final Active Arms",
+    "Num Eliminated", "Elimination Trace", "Alpha UCB",
     "Selected Subsets",
 ] + excel_timing_columns() + ["Status", "Error"]
 
 #: Columns that must never enter the numeric aggregation on the Summary
 #: sheet, beyond the grouping keys. Named once so save_unified_results_to_excel
 #: cannot drift from the column list above.
-NON_NUMERIC_COLUMNS = ["Seed", "Selected Subsets", "Status", "Error"]
+NON_NUMERIC_COLUMNS = ["Seed", "Selected Subsets", "Elimination Trace", "Status", "Error"]
 
 
 def _acquisition_label(acquisition, reward_update, reward_estimate="surrogate"):
@@ -381,7 +393,8 @@ def run_method(method, dataset, max_modalities, seeds, budget_fractions,
                 image_data_home=None, pred_rule="nearest_center",
                 reward_update="subsets", reward_estimate="surrogate",
                 alpha_ucb=2.0, lr=1e-2,
-                acquisition="greedy"):
+                acquisition="greedy",
+                arm_elimination=False):
 
     synthetic_n_views = max_modalities if max_modalities is not None else SYNTHETIC_N_VIEWS
 
@@ -422,8 +435,8 @@ def run_method(method, dataset, max_modalities, seeds, budget_fractions,
         results = multiclass_runner.run_experiment(
             dataset, feedback=feedback,
             acquisition=acquisition, reward_update=reward_update,
-            reward_estimate=reward_estimate, alpha_ucb=alpha_ucb, lr=lr,
-            step_size=step_size, lambda_max=lambda_max,
+            reward_estimate=reward_estimate, arm_elimination=arm_elimination,
+            alpha_ucb=alpha_ucb, lr=lr, step_size=step_size, lambda_max=lambda_max,
             synthetic_n_classes=synthetic_n_classes,
             run_inference=run_inference, image_pool_side=image_pool_side,
             image_data_home=image_data_home,
@@ -447,7 +460,7 @@ def run_method(method, dataset, max_modalities, seeds, budget_fractions,
             dataset, n_init_fraction_points=n_init_fraction_points,
             synthetic_n_classes=synthetic_n_classes,
             acquisition=acquisition, reward_update=reward_update,
-            reward_estimate=reward_estimate,
+            reward_estimate=reward_estimate, arm_elimination=arm_elimination,
             alpha_ucb=alpha_ucb,
             step_size=step_size, lambda_max=lambda_max,
             run_inference=run_inference, image_pool_side=image_pool_side,
@@ -466,7 +479,7 @@ def run_method(method, dataset, max_modalities, seeds, budget_fractions,
 
 def save_unified_results_to_excel(rows, filename, info_rows=None):
     df = pd.DataFrame(rows, columns=UNIFIED_COLUMNS)
-    group_cols = ["Method", "Feedback", "Acquisition", "Reward Estimate", "Alpha UCB",
+    group_cols = ["Method", "Feedback", "Acquisition", "Reward Estimate", "Arm Elimination", "Alpha UCB",
                   "Num Classes", "Warm Start", "Dataset",
                   "Budget Fraction", "Init Fraction"]
     numeric_cols = [
@@ -786,6 +799,11 @@ if __name__ == "__main__":
                               "or just the run_id). Use this after a walltime kill or an OOM "
                               "to recover every cell that completed. The output is tagged "
                               "_partial, because it is a prefix of the intended sweep.")
+    # Default is False, to run it is has to be added to the cli command
+    parser.add_argument("--arm-elimination", action="store_true", 
+                         help="Enable epoch-wise arm elimination. All arms are active initially; "
+                              "elimination is performed after T/2 rounds, then after another T/4, "
+                              "then T/8, etc., using LP solutions computed from UCB and LCB arm rewards.")
     args = parser.parse_args()
 
     if args.rebuild_from:
@@ -840,6 +858,7 @@ if __name__ == "__main__":
         #if args.acquisition in ("greedy", "lp_chain", "lp_full", "ucb_argmax"):
         if uses_empirical_arm_rewards:
             acq_tag += f"-{args.reward_update}"
+        elim_tag = "_armelim" if args.arm_elimination else ""
         alpha_tag = (f"_alpha{args.alpha_ucb:g}" if (args.alpha_ucb != 2.0 and args.acquisition not in ORACLE_ACQUISITION_MODES) else "")
         reward_estimate_is_live = (args.acquisition in ("greedy", "lp_chain"))
         re_tag = (f"_{args.reward_estimate}" if reward_estimate_is_live else "")
@@ -852,7 +871,7 @@ if __name__ == "__main__":
         if args.dataset in SYNTHETIC_DATASETS:
             n_classes = args.num_classes if args.dataset in MULTICLASS_SYNTHETIC_DATASETS else 2
             classes_tag = f"_classes{n_classes}"
-        output_xlsx = str(results_dir / (f"results_{FILENAME_METHOD_LABELS.get(args.method, args.method)}{fb_tag}{acq_tag}{re_tag}{alpha_tag}{dual_tag}_{args.dataset}_max{maxmod_label}_seeds{len(seeds)}{ti_tag}{pr_tag}{classes_tag}.xlsx"))
+        output_xlsx = str(results_dir / (f"results_{FILENAME_METHOD_LABELS.get(args.method, args.method)}{fb_tag}{acq_tag}{re_tag}{elim_tag}{alpha_tag}{dual_tag}_{args.dataset}_max{maxmod_label}_seeds{len(seeds)}{ti_tag}{pr_tag}{classes_tag}.xlsx"))
 
     run = setup_run(
         "run_proposed_methods",
@@ -883,6 +902,7 @@ if __name__ == "__main__":
             pred_rule=args.pred_rule,
             reward_update=args.reward_update,
             reward_estimate=args.reward_estimate,
+            arm_elimination=args.arm_elimination,
             alpha_ucb=args.alpha_ucb, lr=args.lr,
             acquisition=args.acquisition,
         )

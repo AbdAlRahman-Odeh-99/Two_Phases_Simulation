@@ -7,6 +7,7 @@ import numba
 import numpy as np
 from sklearn.metrics import f1_score, roc_auc_score
 from core.two_stage_utils import generate_view_combinations
+from core.arm_elimination import arm_elimination_checkpoints, restrict_candidates, eliminate_arms_ucb_lcb
 from core.submodular_greedy import (
     ACQUISITION_MODES,             # noqa: F401 -- re-exported
     ARGMAX_ACQUISITION_MODES,      # noqa: F401 -- re-exported
@@ -29,6 +30,10 @@ from core.submodular_greedy import (
     mask_to_bits,
     uses_empirical_arm_rewards as _uses_empirical_arm_rewards,
 )
+
+from core.logging_utils import get_logger
+
+_log = get_logger("afa.adaptive")
 
 # ─────────────────────────────────────────────────────────────────────────
 # Prediction
@@ -99,7 +104,7 @@ def run_training_phase(nviews, nclasses, costs, n_train, training_budget,
                         X_train, Y_train, est_means_init, feedback="full",
                         alpha_ucb=2.0, lr=1e-2, step_size=1.0,
                         lambda_max=10.0, rng=None,
-                        acquisition="greedy", reward_update="subsets",
+                        acquisition="greedy", reward_update="subsets", arm_elimination=False,
                         force_free=True, true_means=None,
                         reward_estimate="surrogate"):
     """
@@ -166,7 +171,7 @@ def run_training_phase(nviews, nclasses, costs, n_train, training_budget,
     # so reward_estimate is inert for it -- see the validation below.
     is_argmax = acquisition in ARGMAX_ACQUISITION_MODES
     is_hedge = acquisition in HEDGE_ACQUISITION_MODES
-    uses_full_empirical_table = is_argmax or is_hedge
+    uses_full_empirical_table = (is_argmax or is_hedge or acquisition == "lp_full")
 
     if (feedback == "bandit" and reward_update == "subsets" and uses_empirical_arm_rewards):
         raise ValueError(
@@ -236,6 +241,27 @@ def run_training_phase(nviews, nclasses, costs, n_train, training_budget,
             f"ucb_argmax/hedge already score arms from the empirical accuracy "
             f"table unconditionally, so the flag has nothing to switch "
             f"there -- leave it at 'surrogate' and it is simply inert.")
+    # Arm-elimination compatibility.
+    if arm_elimination:
+        if acquisition == "lp_full_opt":
+            raise ValueError(
+                "arm_elimination is not supported with "
+                "acquisition='lp_full_opt'. Its oracle distribution is "
+                "computed once and does not use the active-arm mask."
+            )
+        if acquisition == "greedy" and not empirical_est:
+            raise ValueError(
+                "Adaptive arm elimination with acquisition='greedy' "
+                "requires reward_estimate='empirical'. Surrogate greedy "
+                "does not maintain an enumerated empirical arm table."
+            )
+        if acquisition == "lp_chain" and not empirical_est:
+            raise ValueError(
+                "Adaptive arm elimination with acquisition='lp_chain' "
+                "requires reward_estimate='empirical'. Surrogate lp_chain "
+                "rebuilds its arm table as the estimated means change, so "
+                "a persistent active-arm mask is not supported."
+            )
     if empirical_est or uses_full_empirical_table:
         if nviews > MAX_REWARD_ESTIMATE_VIEWS:
             raise ValueError(
@@ -283,6 +309,16 @@ def run_training_phase(nviews, nclasses, costs, n_train, training_budget,
         hedge_v = np.ones(2, dtype=np.float64)
         hedge_epsilon = np.sqrt(np.log(2.0) / n_train)
 
+    elimination_trace = []
+    if arm_elimination and combo_masks is not None:
+        active_arms = np.ones(len(combo_masks), dtype=bool)
+        initial_arm_count = int(active_arms.sum())
+        elimination_points = set(arm_elimination_checkpoints(n_train))
+    else:
+        active_arms = None
+        initial_arm_count = 0
+        elimination_points = set()
+
     for t in range(n_train):
         if t < nclasses:
             subset = np.ones(nviews, dtype=bool)
@@ -291,22 +327,25 @@ def run_training_phase(nviews, nclasses, costs, n_train, training_budget,
             if empirical_est:
                 # Empirical-table branch (Greedy)
                 round_idx = max(t - nclasses, 0)
-                ucb = r_hat + np.sqrt(alpha_ucb * np.log(round_idx + 2) / combo_counts)
-                # BUGFIX: this default-arg used to read `ucb_full`, a name
-                # that exists only in the LP branch below. Under
-                # acquisition="greedy" + reward_estimate="empirical" the
-                # first call raised NameError (or, worse, closed over a
-                # stale ucb_full if that branch had ever run in this
-                # process). It is `ucb`, computed on the line above.
-                def gain_func(sel, _ucb=ucb):
+                log_bonus = (alpha_ucb * np.log(round_idx + 2))
+                # Before the first successful elimination, all arms are active,
+                # so preserve the original unconstrained Greedy path.
+                if (active_arms is not None and not np.all(active_arms)):
+                    greedy_active_bits = arm_bits[active_arms]
+                else:
+                    greedy_active_bits = None
+                def gain_func(sel):
                     m = np.zeros(nviews, dtype=bool)
                     m[np.asarray(sel, dtype=int)] = True
-                    return float(_ucb[bit_index[mask_to_bits(m)]])
+                    j_global = bit_index[mask_to_bits(m)]
+                    return float(r_hat[j_global] + np.sqrt(log_bonus / combo_counts[j_global]))
+                    
                 subset = greedy_oracle(None, costs, omd_lambda,
                                        remaining_budget, free_indices,
                                        force_free=force_free,
                                        gain_func=gain_func,
-                                       empty_value=1.0 / nclasses)
+                                       empty_value=1.0 / nclasses,
+                                       active_arm_bits=greedy_active_bits)
             else:
                 # Biased branch (Greedy)
                 diff_mean_sq = pairwise_diff_sq_from_means(est_means)  # (nv, nc, nc)
@@ -321,27 +360,38 @@ def run_training_phase(nviews, nclasses, costs, n_train, training_budget,
                 subset = free_only_subset.copy()
             else:
                 round_idx = max(t - nclasses, 0)
-                ucb = r_hat + np.sqrt(alpha_ucb * np.log(round_idx + 2) / combo_counts)
-                j = argmax_policy_over_estimates(ucb, combo_cost, omd_lambda,
-                                                 remaining_budget)
-                subset = combo_masks[j].copy()
+                # GLOBAL arm-table indices.
+                affordable_idx = np.flatnonzero(combo_cost <= remaining_budget + 1e-12)
+                candidate_idx = restrict_candidates(affordable_idx, active_arms,)
+                # Calculate confidence bounds only for active, affordable arms.
+                candidate_cost = combo_cost[candidate_idx]
+                candidate_ucb  = (r_hat[candidate_idx] + np.sqrt(alpha_ucb * np.log(round_idx + 2)/ combo_counts[candidate_idx]))
+                # j_local indexes candidate_ucb/candidate_cost.
+                j_local = argmax_policy_over_estimates(candidate_ucb, candidate_cost, omd_lambda, remaining_budget,)
+                # Convert the local result back to the permanent arm table.
+                j_global = int(candidate_idx[j_local])
+                subset = combo_masks[j_global].copy()
             is_init = False
         elif is_hedge:
             if remaining_budget <= 0:
                 subset = free_only_subset.copy()
             else:
                 round_idx = max(t - nclasses, 0)
-                ucb = (r_hat + np.sqrt(alpha_ucb * np.log(round_idx + 2) / combo_counts))
+                # GLOBAL indices of affordable and active arms.
+                affordable_idx = np.flatnonzero(combo_cost <= remaining_budget + 1e-12)
+                candidate_idx = restrict_candidates(affordable_idx, active_arms,)
+                candidate_cost = combo_cost[candidate_idx]
+                # Confidence calculation is performed only for candidates.
+                candidate_ucb = (r_hat[candidate_idx] + np.sqrt(alpha_ucb * np.log(round_idx + 2) / combo_counts[candidate_idx]))                
                 hedge_y = hedge_v / hedge_v.sum()
-                effective_cost = (hedge_y[0] + hedge_y[1] * combo_cost)
-                score = ucb / effective_cost
-                affordable = (combo_cost <= remaining_budget + 1e-12)
-                score = np.where(affordable, score, -np.inf,)
-                if np.all(~np.isfinite(score)):
-                    subset = free_only_subset.copy()
-                else:
-                    j = int(np.argmax(score))
-                    subset = combo_masks[j].copy()
+                candidate_effective_cost = (hedge_y[0] + hedge_y[1] * candidate_cost)
+                candidate_score = candidate_ucb / candidate_effective_cost
+                # j_local indexes candidate_score.
+                j_local = int(np.argmax(candidate_score))
+                # Convert to the global arm index.
+                j_global = int(candidate_idx[j_local])
+                # Adaptive result.
+                subset = combo_masks[j_global].copy()
             is_init = False
         elif is_oracle:
             if remaining_budget <= 0:
@@ -355,21 +405,17 @@ def run_training_phase(nviews, nclasses, costs, n_train, training_budget,
                             and not empirical_est)
             act_idx = None
             if empirical_est:
-                # Empirical-table branch (LP approaches)
+                # This can only be empirical lp_chain. Empirical greedy
+                # was already handled by the earlier greedy branch.
                 round_idx_u = max(t - nclasses, 0)
-                ucb_full = r_hat + np.sqrt(alpha_ucb * np.log(round_idx_u + 2) / combo_counts)
-                def gain_func(sel, _ucb=ucb_full):
+                log_bonus = alpha_ucb * np.log(round_idx_u + 2)
+                def gain_func(sel):
                     m = np.zeros(nviews, dtype=bool)
                     m[np.asarray(sel, dtype=int)] = True
-                    return float(_ucb[bit_index[mask_to_bits(m)]])
-                if acquisition == "lp_chain":
-                    combos = greedy_chain(est_means, costs, free_indices,
-                                          force_free=force_free,
-                                          gain_func=gain_func,
-                                          empty_value=1.0 / nclasses)
-                    act_idx = np.array([bit_index[sum(1 << (v - 1) for v in c)] for c in combos], dtype=int)
-                else:
-                    act_idx = np.arange(len(arm_bits), dtype=int)
+                    j_global = bit_index[mask_to_bits(m)]
+                    return float(r_hat[j_global] + np.sqrt(log_bonus / combo_counts[j_global]))
+                combos = greedy_chain(est_means, costs, free_indices, force_free=force_free, gain_func=gain_func, empty_value=1.0 / nclasses,)
+                act_idx = np.array([bit_index[sum(1 << (v - 1) for v in combo)] for combo in combos], dtype=int,)
 
             if rebuild_arms:
                 # Biased branch (LP approaches)
@@ -405,17 +451,22 @@ def run_training_phase(nviews, nclasses, costs, n_train, training_budget,
             else:
                 round_idx = t - nclasses  # 0-based, drives the log(t+1) bonus
                 if empirical_est:
-                    act_masks, act_cost = combo_masks[act_idx], combo_cost[act_idx]
-                    ucb = ucb_full[act_idx]
+                    # Keep only active arms from the newly constructed chain.
+                    candidate_idx = restrict_candidates(act_idx, active_arms,)
+                    # Calculate UCB only for those active chain arms.
+                    candidate_ucb = (r_hat[candidate_idx] + np.sqrt(log_bonus / combo_counts[candidate_idx]))
                 else:
-                    act_masks, act_cost = combo_masks, combo_cost
-                    ucb = r_hat + np.sqrt(alpha_ucb * np.log(round_idx + 2) / combo_counts)
-                #i_lo, i_hi, p_hi, omd_lambda = lp_policy_over_estimates(
-                #    ucb, combo_cost, cost_order, b_allowance)
-                #j = i_hi if (p_hi > 0.0 and float(rng.random()) < p_hi) else i_lo
-                p_lp, omd_lambda = linprog_policy_over_estimates(ucb, act_cost, b_allowance)
-                j = int(rng.choice(len(p_lp), p=p_lp))
-                subset = act_masks[j].copy()
+                    # lp_full, or surrogate lp_chain without elimination:
+                    # restrict first, then calculate UCB only for candidates.
+                    candidate_idx = restrict_candidates(np.arange(len(combo_masks), dtype=int), active_arms,)
+                    candidate_ucb = (r_hat[candidate_idx] + np.sqrt(alpha_ucb * np.log(round_idx + 2) / combo_counts[candidate_idx]))
+                candidate_cost = combo_cost[candidate_idx]
+                p_lp, omd_lambda = linprog_policy_over_estimates(candidate_ucb, candidate_cost, b_allowance,)
+                # Local index into candidate_ucb/candidate_cost/p_lp.
+                j_local = int(rng.choice(len(p_lp), p=p_lp,))
+                # Map back to the permanent arm-table index.
+                j_global = int(candidate_idx[j_local])
+                subset = combo_masks[j_global].copy()
             is_init = False
 
         # budget check
@@ -454,12 +505,21 @@ def run_training_phase(nviews, nclasses, costs, n_train, training_budget,
             played_bits = mask_to_bits(subset)
             if reward_update == "selected":
                 # BANDIT scope
+                # j0 = bit_index.get(played_bits)
+                # targets = [] if j0 is None else [(j0, float(reward))]
                 j0 = bit_index.get(played_bits)
-                targets = [] if j0 is None else [(j0, float(reward))]
+                if (j0 is not None and (active_arms is None or active_arms[j0])):
+                    targets = [(j0, float(reward))]
+                else:
+                    targets = []
             else:
                 # COUNTERFACTUAL REPLAY
                 targets = []
-                for k in np.flatnonzero((arm_bits & played_bits) == arm_bits):
+                candidate_idx = restrict_candidates(np.arange(len(arm_bits), dtype=int), active_arms,)
+                candidate_bits = arm_bits[candidate_idx]
+                contained_local = ((candidate_bits & played_bits) == candidate_bits)
+                contained_idx = candidate_idx[contained_local]
+                for k in contained_idx:
                     m_k = combo_masks[k]
                     y_sub = int(pred_linear_cla(X_train[t, m_k], est_means[:, m_k]))
                     targets.append((int(k), float(y_sub == y_true)))
@@ -506,6 +566,20 @@ def run_training_phase(nviews, nclasses, costs, n_train, training_budget,
             raw_lambda = omd_lambda + step_size * (inst_cost - spending_ratio)
             omd_lambda = max(0, min(lambda_max, raw_lambda))
 
+        completed = t + 1
+        if (arm_elimination and active_arms is not None and completed in elimination_points):
+            remaining_rounds = n_train - completed
+            b_elim = (max(0.0, remaining_budget) / max(1, remaining_rounds))
+            active_arms, elim_info = eliminate_arms_ucb_lcb(r_hat=r_hat, combo_counts=combo_counts, combo_cost=combo_cost, active_arms=active_arms, alpha_ucb=alpha_ucb, round_idx=completed, budget_per_round=b_elim,)
+            _log.info("[arm elimination] t=%d/%d: %d -> %d active arms (removed %d)", completed, n_train, elim_info["before"], elim_info["after"], elim_info["eliminated"],)
+            elimination_trace.append({
+                "completed_rounds": int(completed),
+                "before": int(elim_info["before"]),
+                "after": int(elim_info["after"]),
+                "eliminated": int(elim_info["eliminated"]),
+                "budget_per_remaining_round": float(b_elim),
+            })
+
     correct_vec = (record_pred == np.asarray(Y_train, dtype=int)).astype(float)
     train_acc = float(np.mean(correct_vec))
     cum_train_acc = np.cumsum(correct_vec) / np.arange(1, n_train + 1)
@@ -536,6 +610,12 @@ def run_training_phase(nviews, nclasses, costs, n_train, training_budget,
         "avg_views_acquired": float(np.mean(views_trace)),
         "n_unique_masks": len(seen_masks),
         "selected_subsets": selected_subsets,
+        # Elimination
+        "arm_elimination": bool(arm_elimination),
+        "initial_arms": int(initial_arm_count),
+        "final_active_arms": (int(active_arms.sum()) if active_arms is not None else int(initial_arm_count)),
+        "num_eliminated": (int(initial_arm_count - active_arms.sum()) if active_arms is not None else 0),
+        "elimination_trace": elimination_trace,
     }
 
 

@@ -129,7 +129,9 @@ CELL_FIELDS = (
     "n_train", "n_inference",
     "train_budget", "inference_budget",
     "n_arms", "avg_views_train", "selected_subsets",
-    "status", "error_msg",
+    "status", "error_msg", "arm_elimination",
+    "initial_arms", "final_active_arms", "num_eliminated",
+    "elimination_trace",
 ) + TIMING_COLUMNS
 
 #: seed_time_sec is appended once per SEED (after its budget-fraction loop),
@@ -169,6 +171,7 @@ def run_experiment(
     acquisition="greedy",
     reward_estimate="surrogate",
     reward_update="subsets",
+    arm_elimination=False,
     max_modalities=None,
     seeds=(42, 43, 44, 45, 46),
     budget_fractions=(0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9),
@@ -364,7 +367,7 @@ def run_experiment(
                     est_means_init=est_means_init, feedback=feedback,
                     alpha_ucb=alpha_ucb, step_size=step_size, lambda_max=lambda_max, lr=lr, rng=rng,
                     acquisition=acquisition, reward_update=reward_update,
-                    reward_estimate=reward_estimate,
+                    reward_estimate=reward_estimate, arm_elimination=arm_elimination,
                     true_means=true_means,
                 )
                 train_time = time.time() - train_start
@@ -439,6 +442,11 @@ def run_experiment(
                     "n_inference": n_inf,
                     "train_budget": training_budget,
                     "inference_budget": inference_budget,
+                    "arm_elimination": ph1["arm_elimination"],
+                    "initial_arms": ph1["initial_arms"],
+                    "final_active_arms": ph1["final_active_arms"],
+                    "num_eliminated": ph1["num_eliminated"],
+                    "elimination_trace": ph1["elimination_trace"],
                 }
 
             if vals is None:
@@ -450,6 +458,7 @@ def run_experiment(
                 vals.update({"n_train": n_train, "n_inference": n_inf,
                              "train_budget": training_budget,
                              "inference_budget": inference_budget})
+                vals["elimination_trace"] = []
 
             vals["status"] = outcome.status
             vals["error_msg"] = outcome.error
@@ -538,6 +547,11 @@ def save_results_to_excel(results, budget_fractions, dataset_name, feedback,
                 "Num Arms": r["n_arms"][i] if "n_arms" in r else np.nan,
                 "Avg Views Train": (r["avg_views_train"][i]
                                     if "avg_views_train" in r else np.nan),
+                "Arm Elimination": r["arm_elimination"][i],
+                "Initial Arms": r["initial_arms"][i],
+                "Final Active Arms": r["final_active_arms"][i],
+                "Num Eliminated": r["num_eliminated"][i],
+                "Elimination Trace": str(r["elimination_trace"][i]),
                 "Selected Subsets": serialize_selected_subsets(
                     r["selected_subsets"][i]),
                 "Status": r["status"][i],

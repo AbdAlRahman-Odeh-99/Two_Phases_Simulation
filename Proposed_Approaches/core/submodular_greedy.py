@@ -38,25 +38,6 @@ HEDGE_ACQUISITION_MODES = ("hedge",)
 FULL_ENUMERATION_MODES = ("lp_full", "lp_full_opt", "ucb_argmax", "hedge")
 REWARD_UPDATE_SCOPES = ("subsets", "selected")
 MAX_REWARD_ESTIMATE_VIEWS = 20
-
-# === reward_estimate: WHAT the arm values are, not whether they are unbiased
-#
-# RENAMED. These were "biased" / "unbiased", which collided head-on with the
-# OTHER "unbiased" in this codebase -- the containment-replay acquisition
-# ported from multiclass_supervised_unbiased_adaptive.ipynb, whose
-# `sim_unbiased` is about REPLAY SCOPE (score every contained subset from
-# one observed row), not about estimator bias. Two unrelated meanings on
-# one word, one of which was never accurate anyway: the old "unbiased"
-# table is a uniform running mean over rounds whose classifier keeps
-# improving, so it lags and is biased low (see the CAVEAT in both method
-# modules). The names now say what the values ARE:
-#
-#   "surrogate" (was "biased")    the closed-form Bhattacharyya proxy,
-#                                 computed from estimated means, needs no
-#                                 observations and no enumeration.
-#   "empirical" (was "unbiased")  a measured per-subset accuracy table,
-#                                 filled in from actual predictions, needs
-#                                 2^(nviews-1) arms.
 REWARD_ESTIMATES = ("surrogate", "empirical")
 
 
@@ -75,7 +56,6 @@ def validate_reward_estimate(reward_estimate):
             f"'unbiased' is now 'empirical'. The old names are NOT "
             f"accepted; update the call site or script.")
     return reward_estimate
-
 
 def uses_empirical_arm_rewards(acquisition, reward_estimate="surrogate"):
     return (acquisition in ("lp_chain", "lp_full", "ucb_argmax", "hedge") or (acquisition == "greedy" and reward_estimate == "empirical"))
@@ -103,42 +83,51 @@ def pairwise_diff_sq_from_means(est_means):
 @timed("t_acquisition")
 def greedy_oracle(diff_mean_sq, costs, omd_lambda, remain_budget,
                   free_indices, force_free=True,
-                  gain_func=None, empty_value=0.0):
+                  gain_func=None, empty_value=0.0,
+                  active_arm_bits=None):
     """
-    Parameters
-    ----------
-    diff_mean_sq : (nviews, nc, nc)
-        (Optimistic) squared pairwise per-view mean differences.
-    costs : (nviews,) array
-        Per-view acquisition costs. Zero-cost views are the "free" ones.
-    omd_lambda : float
-        Current dual variable / budget shadow price. A paid view is only
-        added if its gain-per-unit-cost beats this.
-    remain_budget : float
-        Cap on the total cost this call may commit.
-    free_indices : list[int]
-        PYTHON LIST of zero-cost view indices (see module docstring, item 1).
-    force_free : bool, default True
-        Include every free view unconditionally, rather than only when its
-        marginal gain is strictly positive.
+    Cost-benefit greedy subset construction.
 
-    Returns
-    -------
-    (nviews,) bool mask.
+    When active_arm_bits is provided, Greedy may pass through an inactive
+    intermediate prefix only when that prefix is contained in at least one
+    active arm. The final returned subset is always active.
+
+    active_arm_bits=None preserves the original unconstrained behavior.
     """
     if gain_func is None:
         gain_func = lambda sel: multiclass_reward(diff_mean_sq[np.array(sel)])
     nview = len(costs)
     current_cost = 0.0
-    # Value of the EMPTY set. 0.0 is right for the Bhattacharyya surrogate
-    # (d=0 -> 1-exp(0)=0) but WRONG for a learned accuracy table, where the
-    # empty set scores chance = 1/nclasses. Leaving it at 0 inflates every
-    # first-view marginal gain and the ratio test passes for anything.
     current_objective = empty_value
     sel_set = []
     avail_elements = set(range(nview))
-    # Harvest from free views first. `margin_gain` is defined as
-    # risk(sel_set + [i]) - current_objective
+
+    if active_arm_bits is not None:
+        active_arm_bits = np.asarray(active_arm_bits, dtype=np.int64,)
+        if active_arm_bits.size == 0:
+            raise RuntimeError("Greedy received an empty active-arm family.")
+
+    def selection_bits(indices):
+        bits = 0
+        for idx in indices:
+            bits |= 1 << int(idx)
+        return bits
+
+    def is_active_selection(indices):
+        if active_arm_bits is None:
+            return True
+        bits = selection_bits(indices)
+        return bool(np.any(active_arm_bits == bits))
+
+    def has_active_completion(indices):
+        if active_arm_bits is None:
+            return True
+        bits = selection_bits(indices)
+        # True when at least one active arm is a superset of this
+        # possibly-inactive intermediate prefix.
+        return bool(np.any((active_arm_bits & bits) == bits))
+    
+    # Add free views first.
     for i in list(free_indices):
         tmp_select = sel_set + [i]
         margin_gain = gain_func(tmp_select) - current_objective
@@ -147,47 +136,82 @@ def greedy_oracle(diff_mean_sq, costs, omd_lambda, remain_budget,
             current_objective += margin_gain
             avail_elements.remove(i)
     copy_set = list(sel_set)
+
+    # Remember the latest active subset reached along the Greedy path.
+    if is_active_selection(sel_set):
+        last_active_indices = list(sel_set)
+        last_active_reward = float(current_objective)
+    else:
+        last_active_indices = None
+        last_active_reward = -np.inf
+
     while avail_elements and current_cost < remain_budget:
         best_margin = -1
         best_add = None
         for i in avail_elements:
             cost_i = costs[i]
-            if current_cost + cost_i <= remain_budget:
-                tmp_select = sel_set + [i]
-                margin_gain = gain_func(tmp_select) - current_objective
-                # no zero-cost elements remain here; epsilon for safety
-                gain_ratio = margin_gain / (cost_i + 1e-9)
-                # only add it if the margin beats the shadow price
-                if gain_ratio > omd_lambda and gain_ratio > best_margin:
-                    best_margin = gain_ratio
-                    best_add = i
-        if best_add is not None:
-            sel_set.append(best_add)
-            current_cost += costs[best_add]
-            current_objective = gain_func(sel_set)
-            avail_elements.remove(best_add)
-        else:
+            if current_cost + cost_i > remain_budget:
+                continue
+            tmp_select = sel_set + [i]
+            # Do not enter a branch from which no active arm can
+            # subsequently be reached.
+            if not has_active_completion(tmp_select):
+                continue
+
+            margin_gain = gain_func(tmp_select) - current_objective
+            gain_ratio = margin_gain / (cost_i + 1e-9)    
+            # only add it if the margin beats the shadow price
+            if gain_ratio > omd_lambda and gain_ratio > best_margin:
+                best_margin = gain_ratio
+                best_add = i
+
+        if best_add is None:
             break
+        
+        sel_set.append(best_add)
+        current_cost += costs[best_add]
+        current_objective = gain_func(sel_set)
+        avail_elements.remove(best_add)
+
+        if is_active_selection(sel_set):
+            last_active_indices = list(sel_set)
+            last_active_reward = float(current_objective)
+
+    if active_arm_bits is None:
+        # Original unconstrained Greedy result.
+        greedy_solution_reward = float(current_objective)
+        greedy_solution_indices = list(sel_set)
+    else:
+        # If Greedy stopped at an inactive intermediate prefix,
+        # return the latest active prefix reached before it.
+        if last_active_indices is None:
+            raise RuntimeError("Greedy could not reach an active arm from the forced free-view subset.")
+        greedy_solution_reward = last_active_reward
+        greedy_solution_indices = last_active_indices
+
     # Giant item check
-    greedy_solution_reward = current_objective
-    greedy_solution_indices = list(sel_set)
     best_single_item = None
     best_giant_reward = -np.inf
     for i in range(nview):
         if i in copy_set:
             continue
         cost_i = costs[i]
-        if 0 < cost_i <= remain_budget:
-            tmp_giant_indices = copy_set + [i]
-            reward_with_giant = gain_func(tmp_giant_indices)
-            if reward_with_giant > best_giant_reward:
-                best_giant_reward = reward_with_giant
-                best_single_item = i
-    if best_single_item is not None and best_giant_reward > greedy_solution_reward:
+        if not (0 < cost_i <= remain_budget):
+            continue
+        tmp_giant_indices = copy_set + [i]
+        # An eliminated giant arm cannot be returned.
+        if not is_active_selection(tmp_giant_indices):
+            continue
+        reward_with_giant = gain_func(tmp_giant_indices)
+        if reward_with_giant > best_giant_reward:
+            best_giant_reward = reward_with_giant
+            best_single_item = i
+
+    if (best_single_item is not None and best_giant_reward > greedy_solution_reward):
         final_indices = list(copy_set) + [best_single_item]
     else:
         final_indices = greedy_solution_indices
-    mask = np.array([idx in final_indices for idx in range(nview)]).astype("bool")
+    mask = np.array([idx in final_indices for idx in range(nview)], dtype=bool,)
     if not mask.any():
         mask[int(np.argmin(costs))] = True
     return mask
@@ -343,14 +367,6 @@ def linprog_policy_over_estimates(ucb, combo_cost, budget_per_round):
     )
 
     if not res.success:
-        # Unreachable under this codebase's cost convention (the free-view
-        # arm has cost 0, so p = e_free is feasible at any b >= 0), but fall
-        # back to the cheapest arm explicitly rather than returning garbage.
-        #
-        # LOGGED, not silent: this branch used to be reachable only in
-        # theory, and if it ever does fire the run keeps going with a
-        # degenerate policy that looks like a legitimate result. A WARNING
-        # is the difference between noticing that and not.
         from core.logging_utils import get_logger
         get_logger("afa.acquisition").warning(
             "linprog FAILED (status=%s, %s) at budget_per_round=%.6g over %d arms; "
