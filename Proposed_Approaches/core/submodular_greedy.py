@@ -159,9 +159,13 @@ def greedy_oracle(diff_mean_sq, costs, omd_lambda, remain_budget,
                 continue
 
             margin_gain = gain_func(tmp_select) - current_objective
+            # TEMP: CLIP
+            margin_gain = max(0.0, margin_gain)
             gain_ratio = margin_gain / (cost_i + 1e-9)    
             # only add it if the margin beats the shadow price
-            if gain_ratio > omd_lambda and gain_ratio > best_margin:
+            #if gain_ratio > omd_lambda and gain_ratio > best_margin:
+            # TEMP: WITH CLIP
+            if gain_ratio >= omd_lambda and gain_ratio > best_margin:
                 best_margin = gain_ratio
                 best_add = i
 
@@ -207,7 +211,10 @@ def greedy_oracle(diff_mean_sq, costs, omd_lambda, remain_budget,
             best_giant_reward = reward_with_giant
             best_single_item = i
 
-    if (best_single_item is not None and best_giant_reward > greedy_solution_reward):
+    # TEMP: WITH CLIP
+    if omd_lambda <= 1e-12:
+        final_indices = greedy_solution_indices
+    elif (best_single_item is not None and best_giant_reward > greedy_solution_reward):
         final_indices = list(copy_set) + [best_single_item]
     else:
         final_indices = greedy_solution_indices
