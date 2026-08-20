@@ -16,4 +16,4 @@ Add your simulation scripts and documentation here.
 - `notebooks/` - Jupyter notebooks for analysis
 
 ## License
-Specify your license here.
+Please see the attached license
