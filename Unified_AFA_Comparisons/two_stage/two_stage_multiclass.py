@@ -86,6 +86,7 @@ from core.submodular_greedy import (
     MAX_REWARD_ESTIMATE_VIEWS,   # noqa: F401 -- re-exported
     ORACLE_ACQUISITION_MODES,    # noqa: F401 -- re-exported
     REWARD_UPDATE_SCOPES,        # noqa: F401 -- re-exported
+    UCB_STRUCTURES,              # noqa: F401 -- re-exported
     pairwise_diff_sq_from_means,
     arm_accuracies_from_means,
     argmax_policy_over_estimates,
@@ -95,7 +96,9 @@ from core.submodular_greedy import (
     linprog_policy_over_estimates,
     build_arm_tables,
     mask_to_bits,
+    structure_ucb_estimates,
     uses_empirical_arm_rewards as _uses_empirical_arm_rewards,   # noqa: F401
+    validate_ucb_structure,
 )
 
 from core.multiclass_common import (
@@ -151,7 +154,8 @@ def stage1_combo_rewards(x, y, centers, T1, combos, nviews, pred_rule="nearest_c
 
 # Stage 2 (training phase)
 def run_alg_greedy_multiclass(x, y, centers, costs, T1, training_budget, rng,
-                              acquisition="greedy", alpha_ucb=2.0,
+                              acquisition="greedy", ucb_structure="flat",
+                              alpha_ucb=2.0,
                               step_size=1.0, lambda_max=10.0,
                               pred_rule="nearest_center",
                               force_free=True, reward_update="subsets",
@@ -229,6 +233,11 @@ def run_alg_greedy_multiclass(x, y, centers, costs, T1, training_budget, rng,
     if acquisition not in ACQUISITION_MODES:
         raise ValueError(f"acquisition must be one of {ACQUISITION_MODES}, "
                          f"got {acquisition!r}")
+    validate_ucb_structure(ucb_structure)
+    if acquisition != "ucb_argmax" and ucb_structure != "flat":
+        raise ValueError(
+            "ucb_structure is only used by acquisition='ucb_argmax'; "
+            f"got acquisition={acquisition!r}, ucb_structure={ucb_structure!r}")
     if reward_update not in REWARD_UPDATE_SCOPES:
         raise ValueError(f"reward_update must be one of {REWARD_UPDATE_SCOPES}, "
                          f"got {reward_update!r}")
@@ -413,12 +422,18 @@ def run_alg_greedy_multiclass(x, y, centers, costs, T1, training_budget, rng,
             j = int(rng.choice(len(p_oracle), p=p_oracle))
             mask = combo_masks[j].copy()
         elif is_argmax:
+            # Structure the full permanent arm table before restricting
+            # candidates, so an inactive or unaffordable arm can still
+            # inform an eligible arm through the subset Hasse diagram.
+            raw_ucb = (r_hat + np.sqrt(
+                alpha_ucb * np.log(round_idx + 2) / combo_counts))
+            structured_ucb = structure_ucb_estimates(
+                raw_ucb, arm_bits, bit_index, ucb_structure)
             # These are GLOBAL arm-table indices.
             affordable_idx = np.flatnonzero(combo_cost <= training_remaining_budget + 1e-12)
             candidate_idx = restrict_candidates(affordable_idx, active_arms,)
-            # Calculate confidence bounds only for active, affordable arms.
             candidate_cost = combo_cost[candidate_idx]
-            candidate_ucb = (r_hat[candidate_idx] + np.sqrt(alpha_ucb * np.log(round_idx + 2)/ combo_counts[candidate_idx]))
+            candidate_ucb = structured_ucb[candidate_idx]
             # j_local indexes the sliced candidate arrays.
             j_local = argmax_policy_over_estimates(candidate_ucb, candidate_cost, lambda_t, training_remaining_budget,)
             # Convert to the permanent/global arm-table index.
@@ -648,6 +663,7 @@ def run_alg_greedy_multiclass(x, y, centers, costs, T1, training_budget, rng,
         'combo_counts': combo_counts,
         'est_counts': est_counts,
         'acquisition': acquisition,
+        'ucb_structure': ucb_structure,
         'n_arms': (len(combos) if combos is not None else 0),
         'oracle_probs': p_oracle,
         'avg_views_acquired': float(np.mean(views_trace)),

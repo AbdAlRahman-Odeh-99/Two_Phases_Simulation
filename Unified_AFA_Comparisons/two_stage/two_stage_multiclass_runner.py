@@ -72,7 +72,9 @@ from core.optimal_static import synthetic_true_means
 # Single definition of "does --reward-update do anything for these flags",
 # replacing the two inline copies this file used to carry.
 from core.submodular_greedy import (
+    ucb_acquisition_label,
     uses_empirical_arm_rewards as _uses_empirical_arm_rewards,
+    validate_ucb_structure,
 )
 from core.two_stage_utils import calculate_two_stage_error
 from core.training_state import (
@@ -87,6 +89,7 @@ from two_stage.two_stage_multiclass import (
     ORACLE_ACQUISITION_MODES,
     REWARD_ESTIMATES,
     REWARD_UPDATE_SCOPES,
+    UCB_STRUCTURES,
     run_alg_greedy_multiclass,
 )
 
@@ -125,6 +128,7 @@ def run_experiment(
     synthetic_cluster_std=SYNTHETIC_CLUSTER_STD,
     synthetic_n_classes=SYNTHETIC_N_CLASSES,
     acquisition="greedy",
+    ucb_structure="flat",
     reward_estimate="surrogate",
     reward_update="subsets",
     arm_elimination=False,
@@ -155,6 +159,12 @@ def run_experiment(
         raise ValueError(msg)
     if acquisition not in ACQUISITION_MODES:
         raise ValueError(f"acquisition must be one of {ACQUISITION_MODES}, got {acquisition!r}")
+    validate_ucb_structure(ucb_structure)
+    if acquisition != "ucb_argmax" and ucb_structure != "flat":
+        raise ValueError(
+            "ucb_structure is only used by acquisition='ucb_argmax'; "
+            f"got acquisition={acquisition!r}, ucb_structure={ucb_structure!r}")
+    output_acquisition = ucb_acquisition_label(acquisition, ucb_structure)
     if reward_update not in REWARD_UPDATE_SCOPES:
         raise ValueError(f"reward_update must be one of {REWARD_UPDATE_SCOPES}, got {reward_update!r}")
     # MEMBERSHIP check, matching adaptive_runner. Without
@@ -296,6 +306,7 @@ def run_experiment(
                         x=X_train, y=Y_train, centers=centers, costs=costs,
                         T1=n_init_samples, training_budget=training_budget, rng=rng,
                         acquisition=acquisition, reward_update=reward_update,
+                        ucb_structure=ucb_structure,
                         reward_estimate=reward_estimate,
                         arm_elimination=arm_elimination,
                         true_means=true_means,
@@ -324,7 +335,7 @@ def run_experiment(
                         'budget_fraction': budget_fraction,
                         'init_fraction': init_fraction,
                         'Experts': np.nan,
-                        'acquisition': acquisition,
+                        'acquisition': output_acquisition,
                         'reward_estimate': reward_estimate,
                         'reward_update': reward_update if _has_ru else "",
                         'n_arms': stage2_result.get('n_arms', 0),
@@ -396,6 +407,7 @@ def run_experiment(
                             "feature_names": list(feature_names),
                             "run_config": {
                                 "acquisition": acquisition,
+                                "ucb_structure": ucb_structure,
                                 "reward_update": reward_update,
                                 "reward_estimate": reward_estimate,
                                 "alpha_ucb": alpha_ucb,
@@ -447,7 +459,7 @@ def run_experiment(
                         'budget_fraction': budget_fraction,
                         'init_fraction': init_fraction,
                         'Experts': np.nan,            # legacy column; this method does not use EXP4 experts
-                        'acquisition': acquisition,
+                        'acquisition': output_acquisition,
                         'reward_estimate': reward_estimate,
                         'reward_update': reward_update if _has_ru else "",
                         'n_arms': stage2_result.get('n_arms', 0),
@@ -520,7 +532,7 @@ def run_experiment(
                     # outcome, not losing this one row's metrics.
                     row = dict(cell)
                     row['nclasses'] = nclasses
-                    row['acquisition'] = acquisition
+                    row['acquisition'] = output_acquisition
                     row['reward_estimate'] = reward_estimate
                     row['split_mode'] = split_mode
                     row['n_train'] = n_train
@@ -702,8 +714,14 @@ if __name__ == "__main__":
                              "argmax (argmax_S r_hat - lambda*cost + bonus) with greedy's "
                              "OMD dual in place of the LP, so it commits to one subset "
                              "instead of sampling a mixture. Same 2^(nviews-1) cap as "
-                             "lp_full; --reward-estimate is inert under it. All of them "
-                             "hold the classifier frozen after Stage 1.")
+                              "lp_full; --reward-estimate is inert under it. All of them "
+                              "hold the classifier frozen after Stage 1.")
+    parser.add_argument(
+        "--ucb-structure", choices=UCB_STRUCTURES, default="flat",
+        help="Monotone structure for --acquisition ucb_argmax. 'flat' preserves "
+             "the original independent-arm UCBs; 'top_down' caps subsets from "
+             "immediate supersets; 'bottom_up' raises supersets from immediate "
+             "subsets before affordable/active-arm filtering.")
     parser.add_argument("--reward-estimate",
                         choices=list(REWARD_ESTIMATES),
                         default="surrogate",
@@ -784,7 +802,9 @@ if __name__ == "__main__":
     # did not say "greedy" anywhere, and did not sort beside its own
     # lp_chain/lp_full siblings.
     # CHANGES default filenames for surrogate greedy runs only.
-    cu_tag = f"_{args.acquisition}"
+    output_acquisition = ucb_acquisition_label(
+        args.acquisition, args.ucb_structure)
+    cu_tag = f"_{output_acquisition}"
     if uses_reward_update:
         cu_tag += f"-{args.reward_update}"
     ti_tag = "_TR" if args.skip_inference else ""
@@ -847,6 +867,7 @@ if __name__ == "__main__":
             synthetic_mean_scale=args.mean_scale,
             synthetic_n_classes=args.num_classes,
             acquisition=args.acquisition,
+            ucb_structure=args.ucb_structure,
             reward_estimate=args.reward_estimate,
             reward_update=args.reward_update,
             alpha_ucb=args.alpha_ucb,

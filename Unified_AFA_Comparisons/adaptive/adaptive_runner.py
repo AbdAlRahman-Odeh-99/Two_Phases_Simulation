@@ -103,13 +103,16 @@ from adaptive.adaptive import (
     ORACLE_ACQUISITION_MODES,
     REWARD_ESTIMATES,
     REWARD_UPDATE_SCOPES,
+    UCB_STRUCTURES,
     run_training_phase,
     run_inference_phase,
 )
 # Single definition of "does --reward-update do anything for these flags",
 # replacing the three inline copies this file used to carry.
 from core.submodular_greedy import (
+    ucb_acquisition_label,
     uses_empirical_arm_rewards as _uses_empirical_arm_rewards,
+    validate_ucb_structure,
 )
 from core.training_state import (
     find_training_states,
@@ -179,6 +182,7 @@ def run_experiment(
     dataset_name,
     feedback="full",
     acquisition="greedy",
+    ucb_structure="flat",
     reward_estimate="surrogate",
     reward_update="subsets",
     arm_elimination=False,
@@ -255,6 +259,11 @@ def run_experiment(
     if acquisition not in ACQUISITION_MODES:
         raise ValueError(f"acquisition must be one of {ACQUISITION_MODES}, "
                           f"got {acquisition!r}")
+    validate_ucb_structure(ucb_structure)
+    if acquisition != "ucb_argmax" and ucb_structure != "flat":
+        raise ValueError(
+            "ucb_structure is only used by acquisition='ucb_argmax'; "
+            f"got acquisition={acquisition!r}, ucb_structure={ucb_structure!r}")
     if reward_update not in REWARD_UPDATE_SCOPES:
         raise ValueError(f"reward_update must be one of {REWARD_UPDATE_SCOPES}, "
                           f"got {reward_update!r}")
@@ -384,6 +393,7 @@ def run_experiment(
                     est_means_init=est_means_init, feedback=feedback,
                     alpha_ucb=alpha_ucb, step_size=step_size, lambda_max=lambda_max, lr=lr, rng=rng,
                     acquisition=acquisition, reward_update=reward_update,
+                    ucb_structure=ucb_structure,
                     reward_estimate=reward_estimate, arm_elimination=arm_elimination,
                     true_means=true_means,
                 )
@@ -453,6 +463,7 @@ def run_experiment(
                         "run_config": {
                             "feedback": feedback,
                             "acquisition": acquisition,
+                            "ucb_structure": ucb_structure,
                             "reward_update": reward_update,
                             "reward_estimate": reward_estimate,
                             "alpha_ucb": alpha_ucb,
@@ -794,7 +805,13 @@ if __name__ == "__main__":
                               "OMD dual in place of the LP, so it commits to one subset "
                               "instead of sampling a mixture. Same 2^(nviews-1) cap as "
                               "lp_full; --reward-estimate is inert under it (the empirical "
-                              "table is unconditional).")
+                               "table is unconditional).")
+    parser.add_argument(
+        "--ucb-structure", choices=UCB_STRUCTURES, default="flat",
+        help="Monotone structure for --acquisition ucb_argmax. 'flat' preserves "
+             "the original independent-arm UCBs; 'top_down' caps subsets from "
+             "immediate supersets; 'bottom_up' raises supersets from immediate "
+             "subsets before affordable/active-arm filtering.")
     parser.add_argument("--reward-estimate",
                         choices=list(REWARD_ESTIMATES),
                         default="surrogate",
@@ -886,7 +903,9 @@ if __name__ == "__main__":
     max_modalities = None if args.max_modalities.lower() == "all" else int(args.max_modalities)
 
     _cli_has_ru = _uses_empirical_arm_rewards(args.acquisition, args.reward_estimate)
-    acq_label = args.acquisition + (f"/{args.reward_update}" if _cli_has_ru else "")
+    output_acquisition = ucb_acquisition_label(
+        args.acquisition, args.ucb_structure)
+    acq_label = output_acquisition + (f"/{args.reward_update}" if _cli_has_ru else "")
 
     ti_tag = "_TR" if args.skip_inference else ""
     # max_modalities is None when --max-modalities all was passed (no
@@ -908,7 +927,7 @@ if __name__ == "__main__":
     # "results_gmm_full_surrogate_..." was a greedy run whose name did not say
     # so, and did not sort beside its own lp_chain/lp_full siblings.
     # CHANGES default filenames for surrogate greedy runs only.
-    acq_tag = f"_{args.acquisition}"
+    acq_tag = f"_{output_acquisition}"
     if _cli_has_ru:
         acq_tag += f"-{args.reward_update}"
 
@@ -947,6 +966,7 @@ if __name__ == "__main__":
             args.dataset,
             feedback=args.feedback,
             acquisition=args.acquisition,
+            ucb_structure=args.ucb_structure,
             reward_estimate=args.reward_estimate,
             reward_update=args.reward_update,
             max_modalities=max_modalities,
@@ -1001,7 +1021,7 @@ if __name__ == "__main__":
 
     save_results_to_excel(results, budget_fractions, args.dataset, args.feedback,
                           seeds=seeds, filename=output_xlsx,
-                          acquisition=args.acquisition,
+                          acquisition=output_acquisition,
                           reward_estimate=args.reward_estimate,
                           reward_update=(args.reward_update if _cli_has_ru else ""),
                           info_rows=run.info_rows())

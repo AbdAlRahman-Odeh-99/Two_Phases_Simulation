@@ -94,6 +94,8 @@ from core.submodular_greedy import (
     ARGMAX_ACQUISITION_MODES,
     ORACLE_ACQUISITION_MODES,
     REWARD_ESTIMATES,
+    UCB_STRUCTURES,
+    ucb_acquisition_label,
     uses_empirical_arm_rewards as _uses_empirical_arm_rewards,
     REWARD_UPDATE_SCOPES,
 )
@@ -383,8 +385,10 @@ UNIFIED_COLUMNS = [
 NON_NUMERIC_COLUMNS = ["Seed", "Split Mode", "Selected Subsets", "Elimination Trace", "Status", "Error"]
 
 
-def _acquisition_label(acquisition, reward_update, reward_estimate="surrogate"):
+def _acquisition_label(acquisition, reward_update, reward_estimate="surrogate",
+                       ucb_structure="flat"):
     uses_reward_update = _uses_empirical_arm_rewards(acquisition, reward_estimate)
+    acquisition = ucb_acquisition_label(acquisition, ucb_structure)
     if not uses_reward_update:
         return acquisition
     return f"{acquisition}+{reward_update}"
@@ -404,6 +408,7 @@ def run_method(method, dataset, max_modalities, seeds, budget_fractions,
                 reward_update="subsets", reward_estimate="surrogate",
                 alpha_ucb=2.0, lr=1e-2,
                 acquisition="greedy",
+                ucb_structure="flat",
                 arm_elimination=False,
                 split_mode="80-20",
                 state_file=None):
@@ -448,6 +453,7 @@ def run_method(method, dataset, max_modalities, seeds, budget_fractions,
         results = multiclass_runner.run_experiment(
             dataset, feedback=feedback,
             acquisition=acquisition, reward_update=reward_update,
+            ucb_structure=ucb_structure,
             reward_estimate=reward_estimate, arm_elimination=arm_elimination,
             alpha_ucb=alpha_ucb, lr=lr, step_size=step_size, lambda_max=lambda_max,
             synthetic_n_classes=synthetic_n_classes,
@@ -464,7 +470,8 @@ def run_method(method, dataset, max_modalities, seeds, budget_fractions,
         return _normalize_frac_keyed_results(
             results, budget_fractions, seeds, dataset, "adaptive",
             feedback=feedback, n_classes=n_classes,
-            acquisition=_acquisition_label(acquisition, reward_update, reward_estimate),
+            acquisition=_acquisition_label(
+                acquisition, reward_update, reward_estimate, ucb_structure),
             reward_estimate=reward_estimate,
             alpha_ucb=alpha_ucb,
         )
@@ -474,6 +481,7 @@ def run_method(method, dataset, max_modalities, seeds, budget_fractions,
             dataset, n_init_fraction_points=n_init_fraction_points,
             synthetic_n_classes=synthetic_n_classes,
             acquisition=acquisition, reward_update=reward_update,
+            ucb_structure=ucb_structure,
             reward_estimate=reward_estimate, arm_elimination=arm_elimination,
             alpha_ucb=alpha_ucb,
             step_size=step_size, lambda_max=lambda_max,
@@ -484,7 +492,8 @@ def run_method(method, dataset, max_modalities, seeds, budget_fractions,
         )
         return normalize_two_stage(
             all_results, dataset, "two_stage",
-            acquisition=_acquisition_label(acquisition, reward_update, reward_estimate),
+            acquisition=_acquisition_label(
+                acquisition, reward_update, reward_estimate, ucb_structure),
             reward_estimate=reward_estimate,
             alpha_ucb=alpha_ucb,
         )
@@ -519,7 +528,8 @@ def run_inference_from_saved_states(source):
             acquisition=_acquisition_label(
                 config.get("acquisition", "greedy"),
                 config.get("reward_update", "subsets"),
-                config.get("reward_estimate", "surrogate")),
+                config.get("reward_estimate", "surrogate"),
+                config.get("ucb_structure", "flat")),
             reward_estimate=config.get("reward_estimate", np.nan),
             alpha_ucb=config.get("alpha_ucb", np.nan),
         ), method, dataset
@@ -530,7 +540,8 @@ def run_inference_from_saved_states(source):
             acquisition=_acquisition_label(
                 config.get("acquisition", "greedy"),
                 config.get("reward_update", "subsets"),
-                config.get("reward_estimate", "surrogate")),
+                config.get("reward_estimate", "surrogate"),
+                config.get("ucb_structure", "flat")),
             reward_estimate=config.get("reward_estimate", np.nan),
             alpha_ucb=config.get("alpha_ucb", np.nan),
         ), method, dataset
@@ -618,7 +629,8 @@ def rebuild_from_checkpoint(source, output_xlsx=None):
     dataset = a.get("dataset", "")
     acquisition = _acquisition_label(a.get("acquisition", "greedy"),
                                      a.get("reward_update", "subsets"),
-                                     a.get("reward_estimate", "surrogate"))
+                                     a.get("reward_estimate", "surrogate"),
+                                     a.get("ucb_structure", "flat"))
 
     if method == "two_stage":
         rows = normalize_two_stage(
@@ -764,7 +776,14 @@ if __name__ == "__main__":
                               "UCB(S) / (y_time + y_cost*cost(S)), where the resource weights "
                               "are updated multiplicatively. It uses no OMD lambda. "
                               "--reward-update is live, --reward-estimate is inert, and the "
-                              "same MAX_REWARD_ESTIMATE_VIEWS cap applies.")
+                               "same MAX_REWARD_ESTIMATE_VIEWS cap applies.")
+    parser.add_argument(
+        "--ucb-structure", choices=UCB_STRUCTURES, default="flat",
+        help="BOTH methods, with --acquisition ucb_argmax: 'flat' preserves "
+             "the original independent-arm UCBs; 'top_down' caps subsets from "
+             "immediate supersets; 'bottom_up' raises supersets from immediate "
+             "subsets. Propagation uses the full arm table before affordable "
+             "or active candidates are selected.")
     parser.add_argument("--reward-estimate",
                         choices=list(REWARD_ESTIMATES),
                         default="surrogate",
@@ -918,7 +937,7 @@ if __name__ == "__main__":
         args.method = resume_meta["method"]
         args.dataset = resume_meta["dataset"]
         resume_config = resume_meta.get("run_config", {})
-        for key in ("feedback", "acquisition", "reward_update",
+        for key in ("feedback", "acquisition", "ucb_structure", "reward_update",
                     "reward_estimate", "alpha_ucb", "lr", "step_size",
                     "lambda_max", "arm_elimination", "pred_rule", "split_mode"):
             if key in resume_config:
@@ -959,7 +978,9 @@ if __name__ == "__main__":
         mode_tag = f"_{mode}" if mode else ""
         split_tag = f"_split{args.split_mode.replace('-', '')}"
         fb_tag = f"_{args.feedback}" if args.method == "adaptive" else ""
-        acq_tag = f"_{args.acquisition}"
+        output_acquisition = ucb_acquisition_label(
+            args.acquisition, args.ucb_structure)
+        acq_tag = f"_{output_acquisition}"
         if uses_empirical_arm_rewards:
             acq_tag += f"-{args.reward_update}"
         elim_tag = "_armelim" if args.arm_elimination else ""
@@ -1056,6 +1077,7 @@ if __name__ == "__main__":
                 arm_elimination=args.arm_elimination,
                 alpha_ucb=args.alpha_ucb, lr=args.lr,
                 acquisition=args.acquisition,
+                ucb_structure=args.ucb_structure,
                 split_mode=args.split_mode,
                 state_file=state_file,
             )

@@ -19,6 +19,7 @@ from core.submodular_greedy import (
     MAX_REWARD_ESTIMATE_VIEWS,     # noqa: F401 -- re-exported
     ORACLE_ACQUISITION_MODES,      # noqa: F401 -- re-exported
     REWARD_UPDATE_SCOPES,          # noqa: F401 -- re-exported
+    UCB_STRUCTURES,                # noqa: F401 -- re-exported
     pairwise_diff_sq_from_means,
     arm_accuracies_from_means,
     argmax_policy_over_estimates,
@@ -28,7 +29,9 @@ from core.submodular_greedy import (
     lp_policy_over_estimates,
     linprog_policy_over_estimates,
     mask_to_bits,
+    structure_ucb_estimates,
     uses_empirical_arm_rewards as _uses_empirical_arm_rewards,
+    validate_ucb_structure,
 )
 
 from core.logging_utils import get_logger
@@ -104,7 +107,8 @@ def run_training_phase(nviews, nclasses, costs, n_train, training_budget,
                         X_train, Y_train, est_means_init, feedback="full",
                         alpha_ucb=2.0, lr=1e-2, step_size=1.0,
                         lambda_max=10.0, rng=None,
-                        acquisition="greedy", reward_update="subsets", arm_elimination=False,
+                        acquisition="greedy", ucb_structure="flat",
+                        reward_update="subsets", arm_elimination=False,
                         force_free=True, true_means=None,
                         reward_estimate="surrogate"):
     """
@@ -155,6 +159,11 @@ def run_training_phase(nviews, nclasses, costs, n_train, training_budget,
     if acquisition not in ACQUISITION_MODES:
         raise ValueError(f"acquisition must be one of {ACQUISITION_MODES}, "
                          f"got {acquisition!r}")
+    validate_ucb_structure(ucb_structure)
+    if acquisition != "ucb_argmax" and ucb_structure != "flat":
+        raise ValueError(
+            "ucb_structure is only used by acquisition='ucb_argmax'; "
+            f"got acquisition={acquisition!r}, ucb_structure={ucb_structure!r}")
     if reward_update not in REWARD_UPDATE_SCOPES:
         raise ValueError(f"reward_update must be one of {REWARD_UPDATE_SCOPES}, "
                          f"got {reward_update!r}")
@@ -366,12 +375,18 @@ def run_training_phase(nviews, nclasses, costs, n_train, training_budget,
                 subset = free_only_subset.copy()
             else:
                 round_idx = max(t - nclasses, 0)
+                # Structure the full permanent arm table before restricting
+                # candidates, so an inactive or unaffordable arm can still
+                # inform an eligible arm through the subset Hasse diagram.
+                raw_ucb = (r_hat + np.sqrt(
+                    alpha_ucb * np.log(round_idx + 2) / combo_counts))
+                structured_ucb = structure_ucb_estimates(
+                    raw_ucb, arm_bits, bit_index, ucb_structure)
                 # GLOBAL arm-table indices.
                 affordable_idx = np.flatnonzero(combo_cost <= remaining_budget + 1e-12)
                 candidate_idx = restrict_candidates(affordable_idx, active_arms,)
-                # Calculate confidence bounds only for active, affordable arms.
                 candidate_cost = combo_cost[candidate_idx]
-                candidate_ucb  = (r_hat[candidate_idx] + np.sqrt(alpha_ucb * np.log(round_idx + 2)/ combo_counts[candidate_idx]))
+                candidate_ucb = structured_ucb[candidate_idx]
                 # j_local indexes candidate_ucb/candidate_cost.
                 j_local = argmax_policy_over_estimates(candidate_ucb, candidate_cost, omd_lambda, remaining_budget,)
                 # Convert the local result back to the permanent arm table.
@@ -603,6 +618,7 @@ def run_training_phase(nviews, nclasses, costs, n_train, training_budget,
         "spent": total_spent,
         # ── acquisition diagnostics (extra keys; existing callers ignore) ──
         "acquisition": acquisition,
+        "ucb_structure": ucb_structure,
         "reward_update": (reward_update if uses_empirical_arm_rewards else ""),
         "n_arms": 0 if combo_masks is None else int(combo_masks.shape[0]),
         "combo_rewards": r_hat,

@@ -39,6 +39,7 @@ FULL_ENUMERATION_MODES = ("lp_full", "lp_full_opt", "ucb_argmax", "hedge")
 REWARD_UPDATE_SCOPES = ("subsets", "selected")
 MAX_REWARD_ESTIMATE_VIEWS = 20
 REWARD_ESTIMATES = ("surrogate", "empirical")
+UCB_STRUCTURES = ("flat", "top_down", "bottom_up")
 
 
 def validate_reward_estimate(reward_estimate):
@@ -56,6 +57,25 @@ def validate_reward_estimate(reward_estimate):
             f"'unbiased' is now 'empirical'. The old names are NOT "
             f"accepted; update the call site or script.")
     return reward_estimate
+
+
+def validate_ucb_structure(ucb_structure):
+    """Validate and return the monotone-UCB structure option."""
+    if ucb_structure not in UCB_STRUCTURES:
+        raise ValueError(
+            f"ucb_structure must be one of {UCB_STRUCTURES}; got "
+            f"{ucb_structure!r}.")
+    return ucb_structure
+
+
+def ucb_acquisition_label(acquisition, ucb_structure="flat"):
+    """Output/filename label, while keeping the internal acquisition stable."""
+    validate_ucb_structure(ucb_structure)
+    if acquisition == "ucb_argmax":
+        compact = ucb_structure.replace("_", "")
+        return f"ucb_argmax_{compact}"
+    return acquisition
+
 
 def uses_empirical_arm_rewards(acquisition, reward_estimate="surrogate"):
     return (acquisition in ("lp_chain", "lp_full", "ucb_argmax", "hedge") or (acquisition == "greedy" and reward_estimate == "empirical"))
@@ -453,6 +473,54 @@ def argmax_policy_over_estimates(ucb, combo_cost, omd_lambda,
             return int(np.argmin(combo_cost))
         score = np.where(affordable, score, -np.inf)
     return int(np.argmax(score))
+
+
+def structure_ucb_estimates(ucb, arm_bits, bit_index, ucb_structure="flat"):
+    """Propagate UCBs over immediate edges of the subset Hasse diagram.
+
+    ``top_down`` visits larger arms first and caps each immediate child by
+    its parent. ``bottom_up`` visits smaller arms first and raises each
+    immediate parent by its child. The ordering makes those local, one-bit
+    updates propagate transitively without constructing transitive edges.
+
+    The full arm table must be supplied. Candidate filtering belongs after
+    this transformation so inactive or currently unaffordable arms can still
+    inform arms that remain eligible for the Lagrangian argmax.
+    """
+    validate_ucb_structure(ucb_structure)
+    structured = np.asarray(ucb, dtype=np.float64).ravel().copy()
+    arm_bits = np.asarray(arm_bits, dtype=np.int64).ravel()
+    if structured.shape != arm_bits.shape:
+        raise ValueError(
+            "ucb and arm_bits must have the same shape; got "
+            f"{structured.shape} and {arm_bits.shape}")
+    if ucb_structure == "flat" or structured.size == 0:
+        return structured
+
+    universe_bits = 0
+    for bits in arm_bits:
+        universe_bits |= int(bits)
+    order = sorted(
+        range(len(arm_bits)),
+        key=lambda j: bin(int(arm_bits[j])).count("1"),
+        reverse=(ucb_structure == "top_down"),
+    )
+
+    for child_idx in order:
+        child_bits = int(arm_bits[child_idx])
+        missing_bits = universe_bits & ~child_bits
+        while missing_bits:
+            added_bit = missing_bits & -missing_bits
+            parent_idx = bit_index.get(child_bits | added_bit)
+            if parent_idx is not None:
+                if ucb_structure == "top_down":
+                    structured[child_idx] = min(
+                        structured[child_idx], structured[parent_idx])
+                else:
+                    structured[parent_idx] = max(
+                        structured[parent_idx], structured[child_idx])
+            missing_bits ^= added_bit
+    return structured
 
 
 def build_arm_tables(combos, costs, nviews):
