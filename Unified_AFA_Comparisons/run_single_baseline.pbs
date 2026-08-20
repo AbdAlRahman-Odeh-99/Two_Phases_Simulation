@@ -1,0 +1,129 @@
+#!/bin/bash
+#
+# run_single_baseline.pbs
+#
+# Runs ONE EDDI/DIME baseline (baselines/run_baselines.py) for a single
+# (method, dataset). submit_baselines.sh calls:
+#
+#   qsub -v METHOD=...,DATASET=...,SEEDS_PBS=...,MAXMOD=...[,EXTRA_ARGS=...] \
+#        -l walltime=... -N ... -o logs/... run_single_baseline.pbs
+#
+# GPU QUEUE: run_baselines.py does `device = cuda if torch.cuda.is_available()
+# else cpu`, so EDDI's PVAE and DIME's value-network train on the GPU. This
+# job therefore requests one V100 on the gpuvolta queue.
+# For a CPU-only baseline run, copy this file, change the top block to
+# `-q normal -l ncpus=4 -l mem=16GB` and drop the ngpus line.
+#
+# GPU UTILIZATION MONITORING: below, a background `nvidia-smi -l 5` samples
+# GPU util/memory every 5s for the life of the job into
+# logs/gpu_util_<jobid>.csv, and this script prints the PEAK values at the
+# end. This exists because run_baselines.py's DIME path used to silently
+# train on CPU despite requesting a GPU here -- its two internal
+# pl.Trainer(...) calls had no accelerator=/devices= set, so Lightning
+# defaulted to CPU even though the model was .to(device)'d to cuda first
+# (confirmed by actually running this: PBS "Resource Usage" showed 0% GPU
+# utilization for a DIME job). That's now fixed (pl_accelerator/pl_devices
+# derived from the same `device` run_dime already uses), but this per-job
+# peak-utilization check is kept as an ongoing sanity check for every method
+# -- if a future job shows a persistent 0% peak, that's the same class of bug
+# recurring, and this catches it immediately instead of after a full sweep.
+#
+# MAXMOD is an integer OR the literal "all" -- run_baselines.py's
+# --max-modalities now accepts BOTH (aligned with the submodular runner), so
+# it's always passed straight through:
+#   - REAL datasets  -> "all": keep every native feature column; an integer
+#     truncates to the first N columns. Image datasets' feature count is set
+#     separately via --image-pool-side in EXTRA_ARGS.
+#   - SYNTHETIC (synthetic) -> --max-modalities has NO effect on width;
+#     the generated view count is --n-views (in EXTRA_ARGS), the sample count
+#     is --n-samples, and the class count is --num-classes -- exactly the same
+#     flags the submodular runner uses.
+#
+# Resource directives below are shared defaults; only walltime and the job
+# name/-o are overridden per submission from submit_baselines.sh.
+
+#PBS -P zf94
+#PBS -q gpuvolta
+#PBS -l ngpus=1
+#PBS -l ncpus=12
+#PBS -l mem=16GB
+#PBS -l jobfs=10GB
+#PBS -l storage=gdata/zf94+scratch/zf94
+#PBS -l wd
+#PBS -j oe
+#PBS -o logs/
+
+set -euo pipefail
+
+# --- EDIT if your shared virtualenv lives elsewhere -------------------------
+source /g/data/zf94/Supervised_AFA/env/bin/activate
+# module load cuda/12.5.1   # usually NOT needed: the pip torch wheel bundles
+                            # its own CUDA runtime; the GPU node's driver is
+                            # enough. Uncomment only if your torch build needs
+                            # a system CUDA.
+
+# -l wd already starts the job in the directory qsub was run from (the repo
+# root, since submit_baselines.sh cd's there first). cd again for clarity so
+# `python -m baselines.run_baselines` can resolve `core` / `baselines`.
+cd "${PBS_O_WORKDIR:?submit via submit_baselines.sh from the repo root, do not qsub directly}"
+
+: "${METHOD:?METHOD not set -- submit via submit_baselines.sh}"
+: "${DATASET:?DATASET not set -- submit via submit_baselines.sh}"
+: "${SEEDS_PBS:?SEEDS_PBS not set}"
+: "${MAXMOD:?MAXMOD not set}"
+SEEDS="${SEEDS_PBS//:/,}"
+case "${METHOD}" in
+  eddi|dime|all) ;;
+  *) echo "Invalid METHOD=${METHOD}; expected eddi, dime, or all" >&2; exit 2 ;;
+esac
+
+echo "[${PBS_JOBID:-local}] BASELINE method=${METHOD} dataset=${DATASET} seeds=${SEEDS} max-modalities=${MAXMOD} extra='${EXTRA_ARGS:-}'"
+echo "Host: $(hostname) | Started: $(date)"
+nvidia-smi -L || echo "  (no GPU visible -- run_baselines.py will fall back to CPU)"
+python3 -c "import torch; print('torch', torch.__version__, '| CUDA available:', torch.cuda.is_available())"
+
+# --- Live GPU utilization sampling -----------------------------------------
+# The final PBS "Resource Usage" summary only reports GPU util/mem at ONE
+# instant (often 0% if sampled between bursts), which isn't enough to tell
+# "never used the GPU" apart from "used it in bursts". Sample every 5s in the
+# background for the life of the job instead, into its own CSV next to this
+# job's log; killed via the trap below the moment the python run exits (pass
+# or fail), so it never outlives the job.
+GPU_LOG="logs/gpu_util_${PBS_JOBID%%.*}.csv"
+mkdir -p logs
+nvidia-smi --query-gpu=timestamp,utilization.gpu,memory.used,memory.total \
+    --format=csv -l 5 > "${GPU_LOG}" 2>/dev/null &
+GPU_MON_PID=$!
+trap 'kill "${GPU_MON_PID}" 2>/dev/null || true' EXIT
+
+# run_baselines.py auto-creates results/ and writes its CSV there.
+# --max-modalities accepts "all" or an integer (same as the submodular
+# runner): real datasets -> "all" keeps every column / int truncates; for
+# synthetic the generated width is --n-views (in EXTRA_ARGS), not this.
+# Capture the exit code (instead of letting `set -e` abort immediately) so
+# the GPU peak-utilization summary below still prints on a FAILED run too --
+# that's often exactly when it matters most (e.g. "did it even reach the GPU
+# before crashing?").
+set +e
+python3 -m baselines.run_baselines \
+    --method "${METHOD}" \
+    --dataset "${DATASET}" \
+    --max-modalities "${MAXMOD}" \
+    --seeds "${SEEDS}" \
+    ${EXTRA_ARGS:-}
+RUN_STATUS=$?
+set -e
+
+# Peak utilization/memory across the whole job, from the sampled CSV -- the
+# quick "was the GPU actually used" check. Full trace is in ${GPU_LOG} if you
+# want to look closer (e.g. plot it, or check WHEN in the run it spiked).
+echo ""
+echo "GPU utilization samples: ${GPU_LOG}"
+awk -F', *' '{gsub(/ %/,"",$2); gsub(/ MiB/,"",$3);
+              if ($2 ~ /^[0-9]+$/ && $2+0>maxu) maxu=$2+0;
+              if ($3 ~ /^[0-9]+$/ && $3+0>maxm) maxm=$3+0}
+             END {print "  Peak GPU utilization: " maxu "% | Peak GPU memory used: " maxm " MiB"}' "${GPU_LOG}" \
+    || echo "  (could not summarize -- inspect ${GPU_LOG} directly)"
+
+echo "Finished: $(date) | exit status: ${RUN_STATUS}"
+exit "${RUN_STATUS}"

@@ -1,0 +1,43 @@
+#!/bin/bash
+# Run one adaptive or two-stage experiment on NCI Gadi.
+# Required qsub variables: METHOD, DATASET, SPLIT_MODE, SEEDS_PBS, MAXMOD.
+
+#PBS -P zf94
+#PBS -q normal
+#PBS -l ncpus=1
+#PBS -l mem=16GB
+#PBS -l jobfs=4GB
+#PBS -l storage=gdata/zf94+scratch/zf94
+#PBS -l wd
+#PBS -j oe
+#PBS -o logs/
+
+set -euo pipefail
+source /g/data/zf94/Supervised_AFA/env/bin/activate
+cd "${PBS_O_WORKDIR:?submit this job from the Unified_AFA_Comparisons root}"
+
+: "${METHOD:?METHOD must be adaptive or two_stage}"
+: "${DATASET:?DATASET not set}"
+: "${SPLIT_MODE:?SPLIT_MODE must be 80-20 or 60-20-20}"
+: "${SEEDS_PBS:?SEEDS_PBS not set}"
+: "${MAXMOD:?MAXMOD not set}"
+
+case "${METHOD}" in
+  adaptive|two_stage) ;;
+  *) echo "Invalid METHOD=${METHOD}; expected adaptive or two_stage" >&2; exit 2 ;;
+esac
+case "${SPLIT_MODE}" in
+  80-20|60-20-20) ;;
+  *) echo "Invalid SPLIT_MODE=${SPLIT_MODE}" >&2; exit 2 ;;
+esac
+
+SEEDS="${SEEDS_PBS//:/,}"
+mkdir -p logs results
+
+python3 -u run_proposed_methods.py \
+  --method "${METHOD}" \
+  --dataset "${DATASET}" \
+  --split-mode "${SPLIT_MODE}" \
+  --max-modalities "${MAXMOD}" \
+  --seeds "${SEEDS}" \
+  ${EXTRA_ARGS:-}
