@@ -72,8 +72,11 @@ from core.optimal_static import synthetic_true_means
 # Single definition of "does --reward-update do anything for these flags",
 # replacing the two inline copies this file used to carry.
 from core.submodular_greedy import (
+    UCB_BOUNDS,
+    step_size_tag,
     ucb_acquisition_label,
     uses_empirical_arm_rewards as _uses_empirical_arm_rewards,
+    validate_ucb_bound,
     validate_ucb_structure,
 )
 from core.two_stage_utils import calculate_two_stage_error
@@ -129,11 +132,12 @@ def run_experiment(
     synthetic_n_classes=SYNTHETIC_N_CLASSES,
     acquisition="greedy",
     ucb_structure="flat",
+    ucb_bound="hoeffding",
     reward_estimate="surrogate",
     reward_update="subsets",
     arm_elimination=False,
     alpha_ucb=2.0,
-    step_size=1.0,
+    step_size=None,
     lambda_max=10.0,
     split_mode="80-20",
     run_inference=True,
@@ -160,11 +164,19 @@ def run_experiment(
     if acquisition not in ACQUISITION_MODES:
         raise ValueError(f"acquisition must be one of {ACQUISITION_MODES}, got {acquisition!r}")
     validate_ucb_structure(ucb_structure)
+    validate_ucb_bound(ucb_bound)
     if acquisition != "ucb_argmax" and ucb_structure != "flat":
         raise ValueError(
             "ucb_structure is only used by acquisition='ucb_argmax'; "
             f"got acquisition={acquisition!r}, ucb_structure={ucb_structure!r}")
     output_acquisition = ucb_acquisition_label(acquisition, ucb_structure)
+    uses_empirical_arm_rewards = _uses_empirical_arm_rewards(
+        acquisition, reward_estimate)
+    if ucb_bound == "bernstein" and not uses_empirical_arm_rewards:
+        raise ValueError(
+            "ucb_bound='bernstein' requires empirical arm rewards; use an "
+            "empirical-arm acquisition, or greedy with "
+            "reward_estimate='empirical'.")
     if reward_update not in REWARD_UPDATE_SCOPES:
         raise ValueError(f"reward_update must be one of {REWARD_UPDATE_SCOPES}, got {reward_update!r}")
     # MEMBERSHIP check, matching adaptive_runner. Without
@@ -307,6 +319,7 @@ def run_experiment(
                         T1=n_init_samples, training_budget=training_budget, rng=rng,
                         acquisition=acquisition, reward_update=reward_update,
                         ucb_structure=ucb_structure,
+                        ucb_bound=ucb_bound,
                         reward_estimate=reward_estimate,
                         arm_elimination=arm_elimination,
                         true_means=true_means,
@@ -357,6 +370,7 @@ def run_experiment(
                         'training_budget_spent': stage2_result['training_budget_spent'],
                         'training_remaining_budget': stage2_result['training_remaining_budget'],
                         'lambda_final': stage2_result['lambda_final'],
+                        'step_size': stage2_result['step_size'],
                         'train_time_sec': train_time,
                         'error_rate': stage2_result['error_rate'],
                         'avg_reward': stage2_result['avg_reward'],
@@ -408,6 +422,7 @@ def run_experiment(
                             "run_config": {
                                 "acquisition": acquisition,
                                 "ucb_structure": ucb_structure,
+                                "ucb_bound": ucb_bound,
                                 "reward_update": reward_update,
                                 "reward_estimate": reward_estimate,
                                 "alpha_ucb": alpha_ucb,
@@ -485,6 +500,7 @@ def run_experiment(
                         'training_budget_spent': stage2_result['training_budget_spent'],
                         'training_remaining_budget': stage2_result['training_remaining_budget'],
                         'lambda_final': stage2_result['lambda_final'],
+                        'step_size': stage2_result['step_size'],
                         'train_time_sec': train_time,
                         'inference_time_sec': inference_time,
                         'error_rate': stage2_result['error_rate'],
@@ -745,13 +761,22 @@ if __name__ == "__main__":
                              "Used by lp_chain/lp_full and by greedy when --reward-estimate "
                              "empirical. Ignored by surrogate greedy and lp_full_opt.")
     parser.add_argument("--alpha-ucb", type=float, default=2.0,
-                        help="Optimism scale in the exploration bonus "
-                             "sqrt(alpha_ucb*log(t+1))/sqrt(count) (default 2.0, same as "
+                        help="Optimism scale in the exploration bonus (default 2.0, same as "
                              "submodular). 0 disables optimism entirely -- combined with "
                              "--acquisition greedy that makes the oracle deterministic "
                              "given lambda.")
-    parser.add_argument("--step-size", type=float, default=1.0,
-                        help="Stage-2 OMD dual (lambda) ascent step size (default 1.0).")
+    parser.add_argument(
+        "--ucb-bound", choices=UCB_BOUNDS, default="hoeffding",
+        help="Confidence bound for empirical arm rewards. 'hoeffding' "
+             "preserves the existing bonus; 'bernstein' uses the empirical "
+             "reward variance and maintains Welford M2 statistics; 'vc' uses "
+             "alpha_ucb*sqrt((K*d_arm^2+log(t+2))/N_arm).")
+    parser.add_argument(
+        "--step-size", type=float, default=None,
+        help="Stage-2 OMD dual ascent step size. Default: the varying "
+             "schedule 1/sqrt(t+1), where t is the zero-based GLOBAL "
+             "training round, so Stage 2 starts at t=T1. Pass a number to "
+             "use a fixed step size instead.")
     parser.add_argument("--lambda-max", type=float, default=10.0,
                         help="Stage-2 OMD dual variable clip ceiling (default 10.0).")
     parser.add_argument("--skip-inference", action="store_true",
@@ -807,6 +832,8 @@ if __name__ == "__main__":
     cu_tag = f"_{output_acquisition}"
     if uses_reward_update:
         cu_tag += f"-{args.reward_update}"
+    bound_tag = ("" if args.ucb_bound == "hoeffding"
+                 else f"_{args.ucb_bound}")
     ti_tag = "_TR" if args.skip_inference else ""
     maxmod_label = "ALL" if max_modalities is None else str(max_modalities)
     pr_tag = "_pairwisevote" if args.pred_rule == "pairwise_vote" else ""
@@ -815,7 +842,7 @@ if __name__ == "__main__":
     # adaptive_runner.py. This CHANGES default filenames.
     reward_estimate_is_live = (args.acquisition in ("greedy", "lp_chain"))
     re_tag = (f"_{args.reward_estimate}" if reward_estimate_is_live else "")
-    dual_tag = f"_SS{args.step_size:g}_LMD{args.lambda_max:g}"
+    dual_tag = f"_SS{step_size_tag(args.step_size)}_LMD{args.lambda_max:g}"
     classes_tag = ""
     if args.dataset in SYNTHETIC_DATASETS:
         n_classes = args.num_classes if args.dataset in MULTICLASS_SYNTHETIC_DATASETS else 2
@@ -826,7 +853,7 @@ if __name__ == "__main__":
     # of after the sweep, and the run_id can be derived from it so the log,
     # the manifest, the JSONL checkpoint and the workbook all share a stem.
     output_xlsx = args.output_xlsx or (
-        f"results_two_stage{cu_tag}{re_tag}{dual_tag}_"
+        f"results_two_stage{cu_tag}{re_tag}{bound_tag}{dual_tag}_"
         f"{args.dataset}_V{maxmod_label}_T{len(seeds)}"
         f"_split{args.split_mode.replace('-', '')}{ti_tag}{pr_tag}{au_tag}{classes_tag}.xlsx"
     )
@@ -868,6 +895,7 @@ if __name__ == "__main__":
             synthetic_n_classes=args.num_classes,
             acquisition=args.acquisition,
             ucb_structure=args.ucb_structure,
+            ucb_bound=args.ucb_bound,
             reward_estimate=args.reward_estimate,
             reward_update=args.reward_update,
             alpha_ucb=args.alpha_ucb,

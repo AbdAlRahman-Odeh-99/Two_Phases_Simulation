@@ -94,7 +94,9 @@ from core.submodular_greedy import (
     ARGMAX_ACQUISITION_MODES,
     ORACLE_ACQUISITION_MODES,
     REWARD_ESTIMATES,
+    UCB_BOUNDS,
     UCB_STRUCTURES,
+    step_size_tag,
     ucb_acquisition_label,
     uses_empirical_arm_rewards as _uses_empirical_arm_rewards,
     REWARD_UPDATE_SCOPES,
@@ -402,13 +404,14 @@ def run_method(method, dataset, max_modalities, seeds, budget_fractions,
                 synthetic_n_samples, synthetic_seed, synthetic_mean_scale,
                 feedback="full",
                 synthetic_n_classes=SYNTHETIC_N_CLASSES,
-                step_size=1.0, lambda_max=10.0,
+                step_size=None, lambda_max=10.0,
                 run_inference=True, image_pool_side=DEFAULT_IMAGE_POOL_SIDE,
                 image_data_home=None, pred_rule="nearest_center",
                 reward_update="subsets", reward_estimate="surrogate",
                 alpha_ucb=2.0, lr=1e-2,
                 acquisition="greedy",
                 ucb_structure="flat",
+                ucb_bound="hoeffding",
                 arm_elimination=False,
                 split_mode="80-20",
                 state_file=None):
@@ -454,6 +457,7 @@ def run_method(method, dataset, max_modalities, seeds, budget_fractions,
             dataset, feedback=feedback,
             acquisition=acquisition, reward_update=reward_update,
             ucb_structure=ucb_structure,
+            ucb_bound=ucb_bound,
             reward_estimate=reward_estimate, arm_elimination=arm_elimination,
             alpha_ucb=alpha_ucb, lr=lr, step_size=step_size, lambda_max=lambda_max,
             synthetic_n_classes=synthetic_n_classes,
@@ -482,6 +486,7 @@ def run_method(method, dataset, max_modalities, seeds, budget_fractions,
             synthetic_n_classes=synthetic_n_classes,
             acquisition=acquisition, reward_update=reward_update,
             ucb_structure=ucb_structure,
+            ucb_bound=ucb_bound,
             reward_estimate=reward_estimate, arm_elimination=arm_elimination,
             alpha_ucb=alpha_ucb,
             step_size=step_size, lambda_max=lambda_max,
@@ -784,6 +789,13 @@ if __name__ == "__main__":
              "immediate supersets; 'bottom_up' raises supersets from immediate "
              "subsets. Propagation uses the full arm table before affordable "
              "or active candidates are selected.")
+    parser.add_argument(
+        "--ucb-bound", choices=UCB_BOUNDS, default="hoeffding",
+        help="BOTH methods: confidence bound for empirical arm rewards. "
+             "'hoeffding' preserves the existing count-only bonus. "
+             "'bernstein' additionally estimates reward variance with "
+             "Welford M2 and uses an empirical-Bernstein/UCB-V radius. "
+             "'vc' uses alpha_ucb*sqrt((K*d_arm^2+log(t+2))/N_arm).")
     parser.add_argument("--reward-estimate",
                         choices=list(REWARD_ESTIMATES),
                         default="surrogate",
@@ -804,9 +816,13 @@ if __name__ == "__main__":
                          help="synthetic only: how many classes to generate "
                               "(labels {0..K-1}). Every other dataset infers its class "
                               "count from the labels.")
-    parser.add_argument("--step-size", type=float, default=1.0,
-                         help="Adaptive and two_stage: OMD dual ascent step size for "
-                              "greedy and ucb_argmax. Ignored by LP acquisition modes.")
+    parser.add_argument(
+        "--step-size", type=float, default=None,
+        help="Adaptive and two_stage: OMD dual ascent step size for greedy and "
+             "ucb_argmax. Default: the varying schedule 1/sqrt(t+1), where t "
+             "is the zero-based global training round. In two_stage, Stage 2 "
+             "therefore starts at t=T1. Pass a number to use a fixed step size "
+             "instead. Ignored by LP acquisition modes.")
     parser.add_argument("--lambda-max", type=float, default=10.0,
                          help="Adaptive and two_stage: upper bound for the OMD dual "
                               "variable under greedy and ucb_argmax. Ignored by LP modes.")
@@ -937,7 +953,7 @@ if __name__ == "__main__":
         args.method = resume_meta["method"]
         args.dataset = resume_meta["dataset"]
         resume_config = resume_meta.get("run_config", {})
-        for key in ("feedback", "acquisition", "ucb_structure", "reward_update",
+        for key in ("feedback", "acquisition", "ucb_structure", "ucb_bound", "reward_update",
                     "reward_estimate", "alpha_ucb", "lr", "step_size",
                     "lambda_max", "arm_elimination", "pred_rule", "split_mode"):
             if key in resume_config:
@@ -947,6 +963,12 @@ if __name__ == "__main__":
                      "--inference-from-state)")
 
     uses_empirical_arm_rewards = _uses_empirical_arm_rewards(args.acquisition, args.reward_estimate)
+    if args.ucb_bound == "bernstein" and not uses_empirical_arm_rewards:
+        parser.error(
+            "--ucb-bound bernstein requires empirical arm rewards; choose "
+            "lp_chain/lp_full/ucb_argmax/hedge, or use --acquisition greedy "
+            "with --reward-estimate empirical."
+        )
     if (args.method == "adaptive" and args.feedback == "bandit" and args.reward_update == "subsets" and uses_empirical_arm_rewards):
         parser.error(
             "--feedback bandit is incompatible with --reward-update subsets "
@@ -983,11 +1005,13 @@ if __name__ == "__main__":
         acq_tag = f"_{output_acquisition}"
         if uses_empirical_arm_rewards:
             acq_tag += f"-{args.reward_update}"
+        bound_tag = ("" if args.ucb_bound == "hoeffding"
+                     else f"_{args.ucb_bound}")
         elim_tag = "_armelim" if args.arm_elimination else ""
         alpha_tag = (f"_alpha{args.alpha_ucb:g}" if (args.alpha_ucb != 2.0 and args.acquisition not in ORACLE_ACQUISITION_MODES) else "")
         reward_estimate_is_live = (args.acquisition in ("greedy", "lp_chain"))
         re_tag = (f"_{args.reward_estimate}" if reward_estimate_is_live else "")
-        dual_tag = f"_SS{args.step_size:g}_LMD{args.lambda_max:g}"
+        dual_tag = f"_SS{step_size_tag(args.step_size)}_LMD{args.lambda_max:g}"
         pr_tag = ("_pairwisevote" if (args.pred_rule == "pairwise_vote" and args.method in TWO_STAGE_FAMILY) else "")
         maxmod_label = "ALL" if max_modalities is None else str(max_modalities)
         classes_tag = ""
@@ -996,7 +1020,7 @@ if __name__ == "__main__":
             classes_tag = f"_K{n_classes}"
         return str(results_dir / (
             f"results_{FILENAME_METHOD_LABELS.get(args.method, args.method)}"
-            f"{fb_tag}{acq_tag}{re_tag}{elim_tag}{alpha_tag}{dual_tag}_"
+            f"{fb_tag}{acq_tag}{re_tag}{bound_tag}{elim_tag}{alpha_tag}{dual_tag}_"
             f"{args.dataset}_V{maxmod_label}_T{len(seeds)}{split_tag}"
             f"{mode_tag}{pr_tag}{classes_tag}.xlsx"))
 
@@ -1078,6 +1102,7 @@ if __name__ == "__main__":
                 alpha_ucb=args.alpha_ucb, lr=args.lr,
                 acquisition=args.acquisition,
                 ucb_structure=args.ucb_structure,
+                ucb_bound=args.ucb_bound,
                 split_mode=args.split_mode,
                 state_file=state_file,
             )

@@ -104,14 +104,17 @@ from adaptive.adaptive import (
     REWARD_ESTIMATES,
     REWARD_UPDATE_SCOPES,
     UCB_STRUCTURES,
+    UCB_BOUNDS,
     run_training_phase,
     run_inference_phase,
 )
 # Single definition of "does --reward-update do anything for these flags",
 # replacing the three inline copies this file used to carry.
 from core.submodular_greedy import (
+    step_size_tag,
     ucb_acquisition_label,
     uses_empirical_arm_rewards as _uses_empirical_arm_rewards,
+    validate_ucb_bound,
     validate_ucb_structure,
 )
 from core.training_state import (
@@ -183,6 +186,7 @@ def run_experiment(
     feedback="full",
     acquisition="greedy",
     ucb_structure="flat",
+    ucb_bound="hoeffding",
     reward_estimate="surrogate",
     reward_update="subsets",
     arm_elimination=False,
@@ -199,7 +203,7 @@ def run_experiment(
     synthetic_n_classes=SYNTHETIC_N_CLASSES,
     alpha_ucb=2.0,
     lr=1e-2,
-    step_size=1.0,
+    step_size=None,
     lambda_max=10.0,
     split_mode="80-20",
     run_inference=True,
@@ -260,6 +264,7 @@ def run_experiment(
         raise ValueError(f"acquisition must be one of {ACQUISITION_MODES}, "
                           f"got {acquisition!r}")
     validate_ucb_structure(ucb_structure)
+    validate_ucb_bound(ucb_bound)
     if acquisition != "ucb_argmax" and ucb_structure != "flat":
         raise ValueError(
             "ucb_structure is only used by acquisition='ucb_argmax'; "
@@ -271,6 +276,11 @@ def run_experiment(
     if reward_estimate not in REWARD_ESTIMATES:
         raise ValueError(f"reward_estimate must be one of {REWARD_ESTIMATES}, got {reward_estimate!r}")
     uses_empirical_arm_rewards = _uses_empirical_arm_rewards(acquisition, reward_estimate)
+    if ucb_bound == "bernstein" and not uses_empirical_arm_rewards:
+        raise ValueError(
+            "ucb_bound='bernstein' requires empirical arm rewards; use an "
+            "empirical-arm acquisition, or greedy with "
+            "reward_estimate='empirical'.")
 
     if (feedback == "bandit" and reward_update == "subsets"and uses_empirical_arm_rewards):
         raise ValueError(
@@ -394,6 +404,7 @@ def run_experiment(
                     alpha_ucb=alpha_ucb, step_size=step_size, lambda_max=lambda_max, lr=lr, rng=rng,
                     acquisition=acquisition, reward_update=reward_update,
                     ucb_structure=ucb_structure,
+                    ucb_bound=ucb_bound,
                     reward_estimate=reward_estimate, arm_elimination=arm_elimination,
                     true_means=true_means,
                 )
@@ -418,6 +429,7 @@ def run_experiment(
                     "avg_views_train": ph1["avg_views_acquired"],
                     "selected_subsets": ph1["selected_subsets"],
                     "train_spent": ph1["spent"],
+                    "step_size": ph1["step_size"],
                     "train_time_sec": train_time,
                     "split_mode": split_mode,
                     "n_train": n_train,
@@ -464,6 +476,7 @@ def run_experiment(
                             "feedback": feedback,
                             "acquisition": acquisition,
                             "ucb_structure": ucb_structure,
+                            "ucb_bound": ucb_bound,
                             "reward_update": reward_update,
                             "reward_estimate": reward_estimate,
                             "alpha_ucb": alpha_ucb,
@@ -856,6 +869,12 @@ if __name__ == "__main__":
                          help="Per-(class,view) means ~ Uniform(0, mean_scale). The multiclass "
                               "notebook's snrdb=9 corresponds to mean_scale=10**(9/20)~=2.818.")
     parser.add_argument("--alpha-ucb", type=float, default=2.0)
+    parser.add_argument(
+        "--ucb-bound", choices=UCB_BOUNDS, default="hoeffding",
+        help="Confidence bound for empirical arm rewards. 'hoeffding' "
+             "preserves the existing bonus; 'bernstein' uses the empirical "
+             "reward variance and maintains Welford M2 statistics; 'vc' uses "
+             "alpha_ucb*sqrt((K*d_arm^2+log(t+2))/N_arm).")
     parser.add_argument("--lr", type=float, default=1e-2,
                          help="bandit feedback only: complementary-label update learning rate.")
     parser.add_argument("--skip-inference", action="store_true",
@@ -876,8 +895,11 @@ if __name__ == "__main__":
                               "which exceeds $HOME's quota on clusters like NCI Gadi. Point this "
                               "at your project/scratch space if the default location itself lacks "
                               "quota. Ignored for non-image datasets.")
-    parser.add_argument("--step-size", type=float, default=1.0,
-                         help="OMD dual ascent step size for greedy and ucb_argmax.",)
+    parser.add_argument(
+        "--step-size", type=float, default=None,
+        help="OMD dual ascent step size for greedy and ucb_argmax. Default: "
+             "the varying schedule 1/sqrt(t+1), with zero-based training "
+             "round t. Pass a number to use a fixed step size instead.")
     parser.add_argument("--lambda-max", type=float, default=10.0,
                          help="OMD dual clipping ceiling for greedy and ucb_argmax.",)
     parser.add_argument("--output-xlsx", type=str, default=None)
@@ -930,15 +952,17 @@ if __name__ == "__main__":
     acq_tag = f"_{output_acquisition}"
     if _cli_has_ru:
         acq_tag += f"-{args.reward_update}"
+    bound_tag = ("" if args.ucb_bound == "hoeffding"
+                 else f"_{args.ucb_bound}")
 
     reward_estimate_is_live = (args.acquisition in ("greedy", "lp_chain"))
     re_tag = (f"_{args.reward_estimate}" if reward_estimate_is_live else "")
-    dual_tag = f"_SS{args.step_size:g}_LMD{args.lambda_max:g}"
+    dual_tag = f"_SS{step_size_tag(args.step_size)}_LMD{args.lambda_max:g}"
 
     # Computed BEFORE the run -- see the equivalent note in
     # two_stage_multiclass_greedy_runner.py.
     output_xlsx = args.output_xlsx or (
-        f"results_adaptive_{args.feedback}{acq_tag}{re_tag}{dual_tag}_"
+        f"results_adaptive_{args.feedback}{acq_tag}{re_tag}{bound_tag}{dual_tag}_"
         f"{args.dataset}_V{maxmod_label}_T{len(seeds)}"
         f"_split{args.split_mode.replace('-', '')}{ti_tag}{classes_tag}.xlsx"
     )
@@ -967,6 +991,7 @@ if __name__ == "__main__":
             feedback=args.feedback,
             acquisition=args.acquisition,
             ucb_structure=args.ucb_structure,
+            ucb_bound=args.ucb_bound,
             reward_estimate=args.reward_estimate,
             reward_update=args.reward_update,
             max_modalities=max_modalities,

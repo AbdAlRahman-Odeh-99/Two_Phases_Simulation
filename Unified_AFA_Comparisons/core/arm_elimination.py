@@ -8,6 +8,8 @@ import numba
 import numpy as np
 import scipy.optimize as opt
 
+from core.submodular_greedy import ucb_confidence_bonus, validate_ucb_bound
+
 def arm_elimination_checkpoints(T, min_remaining=10):
     """
     Cumulative checkpoints for epoch lengths T/2, T/4, T/8, ...
@@ -64,7 +66,10 @@ def solve_elimination_lp(rewards, costs, budget_per_round):
         p /= p.sum()
     return p
 
-def eliminate_arms_ucb_lcb(r_hat, combo_counts, combo_cost, active_arms, alpha_ucb, round_idx, budget_per_round, tol=1e-9,):
+def eliminate_arms_ucb_lcb(r_hat, combo_counts, combo_cost, active_arms,
+                           alpha_ucb, round_idx, budget_per_round, tol=1e-9,
+                           ucb_bound="hoeffding", reward_m2=None,
+                           vc_dimension=None):
     """
     Eliminate arms using UCB- and LCB-based LP solutions.
     Only currently active arms participate.
@@ -84,7 +89,13 @@ def eliminate_arms_ucb_lcb(r_hat, combo_counts, combo_cost, active_arms, alpha_u
         raise ValueError("All active arm counts must be positive.")
     
 
-    bonus = np.sqrt(alpha_ucb * np.log(round_idx + 2) / combo_counts[active_idx])
+    validate_ucb_bound(ucb_bound)
+    active_m2 = None if reward_m2 is None else reward_m2[active_idx]
+    active_vc = None if vc_dimension is None else vc_dimension[active_idx]
+    bonus = ucb_confidence_bonus(
+        combo_counts[active_idx], alpha_ucb, round_idx,
+        ucb_bound=ucb_bound, reward_m2=active_m2,
+        vc_dimension=active_vc)
     ucb = r_hat[active_idx] + bonus
     lcb = r_hat[active_idx] - bonus
     costs = combo_cost[active_idx]

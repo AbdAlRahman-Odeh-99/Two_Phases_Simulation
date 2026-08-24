@@ -40,6 +40,7 @@ REWARD_UPDATE_SCOPES = ("subsets", "selected")
 MAX_REWARD_ESTIMATE_VIEWS = 20
 REWARD_ESTIMATES = ("surrogate", "empirical")
 UCB_STRUCTURES = ("flat", "top_down", "bottom_up")
+UCB_BOUNDS = ("hoeffding", "bernstein", "vc")
 
 
 def validate_reward_estimate(reward_estimate):
@@ -68,6 +69,80 @@ def validate_ucb_structure(ucb_structure):
     return ucb_structure
 
 
+def validate_ucb_bound(ucb_bound):
+    """Validate and return the empirical-arm confidence-bound option."""
+    if ucb_bound not in UCB_BOUNDS:
+        raise ValueError(
+            f"ucb_bound must be one of {UCB_BOUNDS}; got {ucb_bound!r}.")
+    return ucb_bound
+
+
+def binary_reward_m2(reward_mean, counts):
+    """Return ``sum((r_i - mean)**2)`` for binary reward samples."""
+    reward_mean = np.asarray(reward_mean, dtype=np.float64)
+    counts = np.asarray(counts, dtype=np.float64)
+    if reward_mean.shape != counts.shape:
+        raise ValueError("reward_mean and counts must have the same shape.")
+    return counts * reward_mean * (1.0 - reward_mean)
+
+
+def update_reward_mean_m2(mean, count, reward, m2=None):
+    """One online reward update, with Welford M2 only when requested."""
+    new_count = float(count) + 1.0
+    delta = float(reward) - float(mean)
+    new_mean = float(mean) + delta / new_count
+    if m2 is None:
+        return new_mean, new_count, None
+    new_m2 = float(m2) + delta * (float(reward) - new_mean)
+    return new_mean, new_count, new_m2
+
+
+def ucb_confidence_bonus(combo_counts, alpha_ucb, round_idx,
+                         ucb_bound="hoeffding", reward_m2=None,
+                         vc_dimension=None):
+    """Confidence radius for bounded empirical arm rewards.
+
+    ``bernstein`` uses the UCB-V empirical-Bernstein radius
+    ``sqrt(2 * variance * x / n) + 3 * x / n``, where
+    ``x = alpha_ucb * log(round_idx + 2)`` and the variance is the unbiased
+    sample variance ``M2 / (n - 1)`` (zero until two samples exist).
+
+    ``vc`` uses the model-complexity radius
+    ``alpha_ucb * sqrt((vc_dimension + log(round_idx + 2)) / n)``.  Callers
+    supply ``vc_dimension = K * d_arm**2`` for each arm.
+    """
+    validate_ucb_bound(ucb_bound)
+    counts = np.asarray(combo_counts, dtype=np.float64)
+    if np.any(counts <= 0):
+        raise ValueError("All arm counts must be positive.")
+    log_scale = float(alpha_ucb) * np.log(int(round_idx) + 2)
+    if log_scale < 0:
+        raise ValueError("alpha_ucb must be non-negative.")
+    if ucb_bound == "hoeffding":
+        return np.sqrt(log_scale / counts)
+    if ucb_bound == "vc":
+        if vc_dimension is None:
+            raise ValueError("vc_dimension is required for ucb_bound='vc'.")
+        complexity = np.asarray(vc_dimension, dtype=np.float64)
+        if complexity.shape != counts.shape:
+            raise ValueError("vc_dimension and combo_counts must have the same shape.")
+        if np.any(complexity < 0):
+            raise ValueError("vc_dimension must be non-negative.")
+        return float(alpha_ucb) * np.sqrt(
+            (complexity + np.log(int(round_idx) + 2)) / counts)
+    if reward_m2 is None:
+        raise ValueError("reward_m2 is required for ucb_bound='bernstein'.")
+    reward_m2 = np.asarray(reward_m2, dtype=np.float64)
+    if reward_m2.shape != counts.shape:
+        raise ValueError("reward_m2 and combo_counts must have the same shape.")
+    variance = np.zeros_like(counts)
+    observed = counts > 1.0
+    variance[observed] = reward_m2[observed] / (counts[observed] - 1.0)
+    variance = np.maximum(variance, 0.0)
+    return (np.sqrt(2.0 * variance * log_scale / counts)
+            + 3.0 * log_scale / counts)
+
+
 def ucb_acquisition_label(acquisition, ucb_structure="flat"):
     """Output/filename label, while keeping the internal acquisition stable."""
     validate_ucb_structure(ucb_structure)
@@ -75,6 +150,46 @@ def ucb_acquisition_label(acquisition, ucb_structure="flat"):
         compact = ucb_structure.replace("_", "")
         return f"ucb_argmax_{compact}"
     return acquisition
+
+
+def resolve_step_size(step_size, time_horizon):
+    """Validate the OMD step-size option.
+
+    ``None`` denotes the automatic per-round schedule ``1 / sqrt(t + 1)``;
+    an explicit number denotes a fixed override.
+    """
+    time_horizon = int(time_horizon)
+    if time_horizon <= 0:
+        raise ValueError(
+            f"time_horizon must be positive, got {time_horizon}")
+    if step_size is None:
+        return None
+    step_size = float(step_size)
+    if not np.isfinite(step_size) or step_size < 0:
+        raise ValueError(
+            f"step_size must be a finite non-negative number or None, got "
+            f"{step_size!r}")
+    return step_size
+
+
+def step_size_at_round(step_size, round_idx):
+    """Return the OMD step size at zero-based global round ``round_idx``."""
+    round_idx = int(round_idx)
+    if round_idx < 0:
+        raise ValueError(f"round_idx must be non-negative, got {round_idx}")
+    if step_size is None:
+        return float(1.0 / np.sqrt(round_idx + 1))
+    step_size = float(step_size)
+    if not np.isfinite(step_size) or step_size < 0:
+        raise ValueError(
+            f"step_size must be a finite non-negative number or None, got "
+            f"{step_size!r}")
+    return step_size
+
+
+def step_size_tag(step_size):
+    """Stable filename representation of explicit and automatic step sizes."""
+    return "invSqrtRound" if step_size is None else f"{float(step_size):g}"
 
 
 def uses_empirical_arm_rewards(acquisition, reward_estimate="surrogate"):

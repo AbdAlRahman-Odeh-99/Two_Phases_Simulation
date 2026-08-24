@@ -20,6 +20,8 @@ from core.submodular_greedy import (
     ORACLE_ACQUISITION_MODES,      # noqa: F401 -- re-exported
     REWARD_UPDATE_SCOPES,          # noqa: F401 -- re-exported
     UCB_STRUCTURES,                # noqa: F401 -- re-exported
+    UCB_BOUNDS,                    # noqa: F401 -- re-exported
+    binary_reward_m2,
     pairwise_diff_sq_from_means,
     arm_accuracies_from_means,
     argmax_policy_over_estimates,
@@ -29,8 +31,13 @@ from core.submodular_greedy import (
     lp_policy_over_estimates,
     linprog_policy_over_estimates,
     mask_to_bits,
+    resolve_step_size,
+    step_size_at_round,
     structure_ucb_estimates,
+    ucb_confidence_bonus,
+    update_reward_mean_m2,
     uses_empirical_arm_rewards as _uses_empirical_arm_rewards,
+    validate_ucb_bound,
     validate_ucb_structure,
 )
 
@@ -105,9 +112,10 @@ def replay_combo_rewards(X_rows, Y_rows, est_means, combo_masks):
 # ─────────────────────────────────────────────────────────────────────────
 def run_training_phase(nviews, nclasses, costs, n_train, training_budget,
                         X_train, Y_train, est_means_init, feedback="full",
-                        alpha_ucb=2.0, lr=1e-2, step_size=1.0,
+                        alpha_ucb=2.0, lr=1e-2, step_size=None,
                         lambda_max=10.0, rng=None,
                         acquisition="greedy", ucb_structure="flat",
+                        ucb_bound="hoeffding",
                         reward_update="subsets", arm_elimination=False,
                         force_free=True, true_means=None,
                         reward_estimate="surrogate"):
@@ -160,6 +168,7 @@ def run_training_phase(nviews, nclasses, costs, n_train, training_budget,
         raise ValueError(f"acquisition must be one of {ACQUISITION_MODES}, "
                          f"got {acquisition!r}")
     validate_ucb_structure(ucb_structure)
+    validate_ucb_bound(ucb_bound)
     if acquisition != "ucb_argmax" and ucb_structure != "flat":
         raise ValueError(
             "ucb_structure is only used by acquisition='ucb_argmax'; "
@@ -176,6 +185,11 @@ def run_training_phase(nviews, nclasses, costs, n_train, training_budget,
     # "unbiased". `empirical_est` can only mean the one thing.
     empirical_est = (reward_estimate == "empirical" and acquisition in ("greedy", "lp_chain"))
     uses_empirical_arm_rewards = _uses_empirical_arm_rewards(acquisition, reward_estimate)
+    if ucb_bound == "bernstein" and not uses_empirical_arm_rewards:
+        raise ValueError(
+            "ucb_bound='bernstein' requires empirical arm rewards; use an "
+            "empirical-arm acquisition, or greedy with "
+            "reward_estimate='empirical'.")
     # ucb_argmax carries the empirical table unconditionally (like lp_full),
     # so reward_estimate is inert for it -- see the validation below.
     is_argmax = acquisition in ARGMAX_ACQUISITION_MODES
@@ -214,6 +228,7 @@ def run_training_phase(nviews, nclasses, costs, n_train, training_budget,
                 f"the post-max_modalities width are not the same thing.")
     if rng is None:
         rng = np.random.default_rng(0)
+    step_size = resolve_step_size(step_size, n_train)
 
     est_means = np.asarray(est_means_init, dtype=np.float64).copy()
     if est_means.shape != (nclasses, nviews):
@@ -238,7 +253,7 @@ def run_training_phase(nviews, nclasses, costs, n_train, training_budget,
 
     # LP-over-arms state
     combo_masks = combo_cost = cost_order = arm_bits = None
-    bit_index = r_hat = combo_counts = None
+    bit_index = r_hat = combo_counts = reward_m2 = None
 
 
 
@@ -287,10 +302,25 @@ def run_training_phase(nviews, nclasses, costs, n_train, training_budget,
         bit_index = tables["bit_index"]
         r_hat = np.full(len(arm_bits), 1.0 / nclasses, dtype=np.float64)
         combo_counts = np.ones(len(arm_bits), dtype=np.float64)
+        if ucb_bound == "bernstein":
+            reward_m2 = np.zeros(len(arm_bits), dtype=np.float64)
 
     # Persistent statistics indexed by the subset's bitmask.
     arm_reward_stats = {}
     arm_count_stats = {}
+    arm_m2_stats = {} if ucb_bound == "bernstein" else None
+
+    def confidence_bonus(indices, round_idx):
+        counts = combo_counts[indices]
+        m2 = None if reward_m2 is None else reward_m2[indices]
+        vc_dimension = None
+        if ucb_bound == "vc":
+            arm_dimension = np.count_nonzero(combo_masks[indices], axis=-1)
+            vc_dimension = nclasses * np.square(arm_dimension)
+        return ucb_confidence_bonus(
+            counts, alpha_ucb, round_idx,
+            ucb_bound=ucb_bound, reward_m2=m2,
+            vc_dimension=vc_dimension)
 
     b_allowance = spending_ratio
     p_oracle = None
@@ -342,7 +372,6 @@ def run_training_phase(nviews, nclasses, costs, n_train, training_budget,
             if empirical_est:
                 # Empirical-table branch (Greedy)
                 round_idx = max(t - nclasses, 0)
-                log_bonus = (alpha_ucb * np.log(round_idx + 2))
                 # Before the first successful elimination, all arms are active,
                 # so preserve the original unconstrained Greedy path.
                 if (active_arms is not None and not np.all(active_arms)):
@@ -353,7 +382,7 @@ def run_training_phase(nviews, nclasses, costs, n_train, training_budget,
                     m = np.zeros(nviews, dtype=bool)
                     m[np.asarray(sel, dtype=int)] = True
                     j_global = bit_index[mask_to_bits(m)]
-                    return float(r_hat[j_global] + np.sqrt(log_bonus / combo_counts[j_global]))
+                    return float(r_hat[j_global] + confidence_bonus(j_global, round_idx))
                     
                 subset = greedy_oracle(None, costs, omd_lambda,
                                        remaining_budget, free_indices,
@@ -378,8 +407,7 @@ def run_training_phase(nviews, nclasses, costs, n_train, training_budget,
                 # Structure the full permanent arm table before restricting
                 # candidates, so an inactive or unaffordable arm can still
                 # inform an eligible arm through the subset Hasse diagram.
-                raw_ucb = (r_hat + np.sqrt(
-                    alpha_ucb * np.log(round_idx + 2) / combo_counts))
+                raw_ucb = r_hat + confidence_bonus(slice(None), round_idx)
                 structured_ucb = structure_ucb_estimates(
                     raw_ucb, arm_bits, bit_index, ucb_structure)
                 # GLOBAL arm-table indices.
@@ -403,7 +431,7 @@ def run_training_phase(nviews, nclasses, costs, n_train, training_budget,
                 candidate_idx = restrict_candidates(affordable_idx, active_arms,)
                 candidate_cost = combo_cost[candidate_idx]
                 # Confidence calculation is performed only for candidates.
-                candidate_ucb = (r_hat[candidate_idx] + np.sqrt(alpha_ucb * np.log(round_idx + 2) / combo_counts[candidate_idx]))                
+                candidate_ucb = r_hat[candidate_idx] + confidence_bonus(candidate_idx, round_idx)
                 hedge_y = hedge_v / hedge_v.sum()
                 candidate_effective_cost = (hedge_y[0] + hedge_y[1] * candidate_cost)
                 candidate_score = candidate_ucb / candidate_effective_cost
@@ -429,12 +457,11 @@ def run_training_phase(nviews, nclasses, costs, n_train, training_budget,
                 # This can only be empirical lp_chain. Empirical greedy
                 # was already handled by the earlier greedy branch.
                 round_idx_u = max(t - nclasses, 0)
-                log_bonus = alpha_ucb * np.log(round_idx_u + 2)
                 def gain_func(sel):
                     m = np.zeros(nviews, dtype=bool)
                     m[np.asarray(sel, dtype=int)] = True
                     j_global = bit_index[mask_to_bits(m)]
-                    return float(r_hat[j_global] + np.sqrt(log_bonus / combo_counts[j_global]))
+                    return float(r_hat[j_global] + confidence_bonus(j_global, round_idx_u))
                 combos = greedy_chain(est_means, costs, free_indices, force_free=force_free, gain_func=gain_func, empty_value=1.0 / nclasses,)
                 act_idx = np.array([bit_index[sum(1 << (v - 1) for v in combo)] for combo in combos], dtype=int,)
 
@@ -453,15 +480,25 @@ def run_training_phase(nviews, nclasses, costs, n_train, training_budget,
                 bit_index = tables["bit_index"]
 
                 seed_rewards, seed_counts = replay_combo_rewards(X_train[warmup_rows], Y_train[warmup_rows], est_means, combo_masks)
+                seed_m2 = None
+                if ucb_bound == "bernstein":
+                    seed_m2 = (binary_reward_m2(seed_rewards, seed_counts)
+                               if warmup_rows else np.zeros_like(seed_rewards))
                 r_hat = np.empty(len(arm_bits), dtype=np.float64)
                 combo_counts = np.empty(len(arm_bits), dtype=np.float64)
+                reward_m2 = (np.empty(len(arm_bits), dtype=np.float64)
+                             if ucb_bound == "bernstein" else None)
                 for j, bits in enumerate(arm_bits):
                     key = int(bits)
                     if key not in arm_reward_stats:
                         arm_reward_stats[key] = float(seed_rewards[j])
                         arm_count_stats[key] = float(seed_counts[j])
+                        if arm_m2_stats is not None:
+                            arm_m2_stats[key] = float(seed_m2[j])
                     r_hat[j] = arm_reward_stats[key]
                     combo_counts[j] = arm_count_stats[key]
+                    if reward_m2 is not None:
+                        reward_m2[j] = arm_m2_stats[key]
 
             # adaptive per-round alloance
             b_allowance = max(0.0, remaining_budget) / max(1, n_train - t)
@@ -475,12 +512,12 @@ def run_training_phase(nviews, nclasses, costs, n_train, training_budget,
                     # Keep only active arms from the newly constructed chain.
                     candidate_idx = restrict_candidates(act_idx, active_arms,)
                     # Calculate UCB only for those active chain arms.
-                    candidate_ucb = (r_hat[candidate_idx] + np.sqrt(log_bonus / combo_counts[candidate_idx]))
+                    candidate_ucb = r_hat[candidate_idx] + confidence_bonus(candidate_idx, round_idx_u)
                 else:
                     # lp_full, or surrogate lp_chain without elimination:
                     # restrict first, then calculate UCB only for candidates.
                     candidate_idx = restrict_candidates(np.arange(len(combo_masks), dtype=int), active_arms,)
-                    candidate_ucb = (r_hat[candidate_idx] + np.sqrt(alpha_ucb * np.log(round_idx + 2) / combo_counts[candidate_idx]))
+                    candidate_ucb = r_hat[candidate_idx] + confidence_bonus(candidate_idx, round_idx)
                 candidate_cost = combo_cost[candidate_idx]
                 p_lp, omd_lambda = linprog_policy_over_estimates(candidate_ucb, candidate_cost, b_allowance,)
                 # Local index into candidate_ucb/candidate_cost/p_lp.
@@ -521,8 +558,17 @@ def run_training_phase(nviews, nclasses, costs, n_train, training_budget,
         y_true = int(Y_train[t])
         reward = y_pred == y_true
 
-        # per-arm reward-estimate update
-        if (combo_masks is not None and not is_oracle and not (empirical_est and is_init)):
+        # Per-arm reward-estimate update. During the forced full-modality
+        # initialization, full-feedback/subset replay can evaluate every arm
+        # contained in the acquired full set, so retain those observations.
+        # Keep selected-only empirical initialization excluded: its recorded
+        # initialization prediction is uniform-random rather than the arm
+        # classifier's prediction and would therefore be a spurious reward.
+        skip_empirical_init_update = (
+            empirical_est and is_init and reward_update == "selected"
+        )
+        if (combo_masks is not None and not is_oracle
+                and not skip_empirical_init_update):
             played_bits = mask_to_bits(subset)
             if reward_update == "selected":
                 # BANDIT scope
@@ -546,12 +592,18 @@ def run_training_phase(nviews, nclasses, costs, n_train, training_budget,
                     targets.append((int(k), float(y_sub == y_true)))
 
             for j0, r_obs in targets:
-                combo_counts[j0] += 1.0
-                r_hat[j0] += (r_obs - r_hat[j0]) / combo_counts[j0]
+                if reward_m2 is None:
+                    combo_counts[j0] += 1.0
+                    r_hat[j0] += (r_obs - r_hat[j0]) / combo_counts[j0]
+                else:
+                    r_hat[j0], combo_counts[j0], reward_m2[j0] = update_reward_mean_m2(
+                        r_hat[j0], combo_counts[j0], r_obs, reward_m2[j0])
                 # Preserve statistics under the subset identity.
                 key = int(arm_bits[j0])
                 arm_reward_stats[key] = float(r_hat[j0])
                 arm_count_stats[key] = float(combo_counts[j0])
+                if arm_m2_stats is not None:
+                    arm_m2_stats[key] = float(reward_m2[j0])
 
         # Update means
         if feedback == "full":
@@ -584,14 +636,20 @@ def run_training_phase(nviews, nclasses, costs, n_train, training_budget,
         # the argmax has no constraint to price and would buy the full view
         # set every round if lambda stayed at 0.
         if acquisition in ("greedy",) + ARGMAX_ACQUISITION_MODES:
-            raw_lambda = omd_lambda + step_size * (inst_cost - spending_ratio)
+            current_step_size = step_size_at_round(step_size, t)
+            raw_lambda = (omd_lambda
+                          + current_step_size * (inst_cost - spending_ratio))
             omd_lambda = max(0, min(lambda_max, raw_lambda))
 
         completed = t + 1
         if (arm_elimination and active_arms is not None and completed in elimination_points):
             remaining_rounds = n_train - completed
             b_elim = (max(0.0, remaining_budget) / max(1, remaining_rounds))
-            active_arms, elim_info = eliminate_arms_ucb_lcb(r_hat=r_hat, combo_counts=combo_counts, combo_cost=combo_cost, active_arms=active_arms, alpha_ucb=alpha_ucb, round_idx=completed, budget_per_round=b_elim,)
+            vc_dimension = None
+            if ucb_bound == "vc":
+                arm_dimension = np.count_nonzero(combo_masks, axis=1)
+                vc_dimension = nclasses * np.square(arm_dimension)
+            active_arms, elim_info = eliminate_arms_ucb_lcb(r_hat=r_hat, combo_counts=combo_counts, combo_cost=combo_cost, active_arms=active_arms, alpha_ucb=alpha_ucb, round_idx=completed, budget_per_round=b_elim, ucb_bound=ucb_bound, reward_m2=reward_m2, vc_dimension=vc_dimension,)
             _log.info("[arm elimination] t=%d/%d: %d -> %d active arms (removed %d)", completed, n_train, elim_info["before"], elim_info["after"], elim_info["eliminated"],)
             elimination_trace.append({
                 "completed_rounds": int(completed),
@@ -619,11 +677,15 @@ def run_training_phase(nviews, nclasses, costs, n_train, training_budget,
         # ── acquisition diagnostics (extra keys; existing callers ignore) ──
         "acquisition": acquisition,
         "ucb_structure": ucb_structure,
+        "ucb_bound": ucb_bound,
         "reward_update": (reward_update if uses_empirical_arm_rewards else ""),
         "n_arms": 0 if combo_masks is None else int(combo_masks.shape[0]),
         "combo_rewards": r_hat,
         "combo_counts": combo_counts,
         "lambda_final": float(omd_lambda),
+        # Final value of the automatic 1/sqrt(t+1) schedule; explicit
+        # --step-size overrides remain constant and are returned unchanged.
+        "step_size": step_size_at_round(step_size, n_train - 1),
         # Last value of the now per-round LP allowance (== spending_ratio
         # under greedy, which never touches it, and the flat one-shot
         # allowance under lp_full_opt).
